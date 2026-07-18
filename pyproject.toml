@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "面向中文书籍PDF的本地MCP服务与命令行工具。"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "GPL-3.0-or-later" }
 authors = [
   { name = "Codex" }
 ]
