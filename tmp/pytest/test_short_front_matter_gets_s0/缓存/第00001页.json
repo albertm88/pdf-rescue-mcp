@@ -1,0 +1,14 @@
+{
+  "page_number": 1,
+  "printed_page": null,
+  "text": "中兽医卷",
+  "confidence": 0.95,
+  "source": "paddleocr",
+  "warnings": [
+    "本页识别文本过短，请复核是否为封面、空白页或漏识别",
+    "疑似封面、扉页或版权页，短文本已保留并列入审计"
+  ],
+  "blocks": [],
+  "ocr_device": null,
+  "gpu_confirmed": false
+}

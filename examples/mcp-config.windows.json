@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "中文PDF书籍救援": {
+      "command": "uv",
+      "args": ["run", "--locked", "python", "-B", "scripts/start_mcp.py"],
+      "cwd": ".",
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONLEGACYWINDOWSSTDIO": "0"
+      }
+    }
+  }
+}

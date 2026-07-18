@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>PDF救援审计报告</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; color: #1f2937; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #d1d5db; padding: 0.45rem; text-align: left; }
+    th { background: #f3f4f6; }
+  </style>
+</head>
+<body>
+  <h1>PDF救援审计报告</h1>
+  <p>状态：完成 | 引擎：逐页缓存</p>
+  <p>总页数：20 | 低置信页：3 | 失败页：0</p>
+  <table>
+    <thead>
+      <tr><th>页码</th><th>来源</th><th>置信度</th><th>字数</th><th>警告</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>飞桨OCR</td><td>0.949</td><td>29</td><td>已移除前置页噪声行；疑似封面、扉页或版权页，短文本已保留并列入审计</td></tr>
+<tr><td>2</td><td>飞桨OCR</td><td>0.920</td><td>196</td><td>已移除前置页噪声行；已校正版权页常见OCR错字</td></tr>
+<tr><td>3</td><td>飞桨OCR</td><td>0.966</td><td>178</td><td>已合并前置页分裂标题或职务标签</td></tr>
+<tr><td>4</td><td>飞桨OCR</td><td>0.957</td><td>375</td><td>已合并前置页分裂标题或职务标签</td></tr>
+<tr><td>5</td><td>飞桨OCR</td><td>0.983</td><td>330</td><td>已合并前置页分裂标题或职务标签</td></tr>
+<tr><td>6</td><td>飞桨OCR</td><td>0.999</td><td>1072</td><td>已合并前置页分裂标题或职务标签</td></tr>
+<tr><td>7</td><td>飞桨OCR</td><td>0.999</td><td>241</td><td></td></tr>
+<tr><td>8</td><td>飞桨OCR</td><td>0.998</td><td>750</td><td>已合并前置页分裂标题或职务标签</td></tr>
+<tr><td>9</td><td>飞桨OCR</td><td>0.983</td><td>177</td><td></td></tr>
+<tr><td>10</td><td>飞桨OCR</td><td>0.965</td><td>205</td><td>疑似目录或索引密集页，已按完整性优先处理</td></tr>
+<tr><td>11</td><td>飞桨OCR</td><td>0.961</td><td>948</td><td>已识别书内页码并从正文移除；疑似目录或索引密集页，已按完整性优先处理</td></tr>
+<tr><td>12</td><td>飞桨OCR</td><td>0.882</td><td>1472</td><td>已识别书内页码并从正文移除；页面平均置信度低于 0.90；疑似目录或索引密集页，已按完整性优先处理；密集页均衡模式已跳过高分辨率重跑，保留较完整原结果</td></tr>
+<tr><td>13</td><td>飞桨OCR</td><td>0.909</td><td>1294</td><td>疑似目录或索引密集页，已按完整性优先处理</td></tr>
+<tr><td>14</td><td>飞桨OCR</td><td>0.881</td><td>1502</td><td>已识别书内页码并从正文移除；已应用术语词表：养蜂卷常见错字；页面平均置信度低于 0.90；疑似目录或索引密集页，已按完整性优先处理；密集页均衡模式已跳过高分辨率重跑，保留较完整原结果</td></tr>
+<tr><td>15</td><td>飞桨OCR</td><td>0.835</td><td>1640</td><td>已识别书内页码并从正文移除；页面平均置信度低于 0.90；疑似目录或索引密集页，已按完整性优先处理；密集页均衡模式已跳过高分辨率重跑，保留较完整原结果</td></tr>
+<tr><td>16</td><td>飞桨OCR</td><td>0.904</td><td>808</td><td>已应用术语词表：养蜂卷常见错字；疑似目录或索引密集页，已按完整性优先处理</td></tr>
+<tr><td>17</td><td>飞桨OCR</td><td>0.983</td><td>1981</td><td>已识别书内页码并从正文移除；已识别并移除拼音索引页眉</td></tr>
+<tr><td>18</td><td>飞桨OCR</td><td>0.967</td><td>2023</td><td>已识别书内页码并从正文移除</td></tr>
+<tr><td>19</td><td>飞桨OCR</td><td>0.971</td><td>1027</td><td>已识别书内页码并从正文移除</td></tr>
+<tr><td>20</td><td>飞桨OCR</td><td>0.976</td><td>2148</td><td>已识别书内页码并从正文移除；已识别并移除拼音索引页眉；已移除页边低置信图像噪声；已应用术语词表：养蜂卷常见错字</td></tr>
+    </tbody>
+  </table>
+</body>
+</html>

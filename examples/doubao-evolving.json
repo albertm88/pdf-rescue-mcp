@@ -1,0 +1,9 @@
+{
+  "model": "Doubao-Evolving",
+  "token_limits": {
+    "context_window": "1024k",
+    "max_input_length": "1024k",
+    "max_thinking_chain_length": "256k",
+    "max_output_length": "256k"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "page_number": 4,
+  "printed_page": null,
+  "text": "运行中缓存正文",
+  "confidence": 0.93,
+  "source": "paddleocr",
+  "warnings": [],
+  "blocks": [],
+  "ocr_device": null,
+  "gpu_confirmed": false
+}

@@ -1,0 +1,14 @@
+{
+  "page_number": 1,
+  "printed_page": null,
+  "text": "更清楚的中文正文",
+  "confidence": 0.96,
+  "source": "paddleocr",
+  "warnings": [
+    "疑似封面、扉页或版权页，短文本已保留并列入审计",
+    "已用 300 点/英寸高分辨率重跑提升质量"
+  ],
+  "blocks": [],
+  "ocr_device": null,
+  "gpu_confirmed": false
+}

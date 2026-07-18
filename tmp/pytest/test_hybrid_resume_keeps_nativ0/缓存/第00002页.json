@@ -1,0 +1,13 @@
+{
+  "page_number": 2,
+  "printed_page": null,
+  "text": "这是扫描页OCR结果。",
+  "confidence": 0.96,
+  "source": "paddleocr",
+  "warnings": [
+    "疑似封面、扉页或版权页，短文本已保留并列入审计"
+  ],
+  "blocks": [],
+  "ocr_device": null,
+  "gpu_confirmed": false
+}

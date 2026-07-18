@@ -1,0 +1,16 @@
+{
+  "page_number": 1,
+  "printed_page": null,
+  "text": "仍然不够清楚",
+  "confidence": 0.72,
+  "source": "paddleocr",
+  "warnings": [
+    "页面平均置信度低于 0.90",
+    "高分辨率重跑未改善，保留原结果",
+    "本页识别文本过短，请复核是否为封面、空白页或漏识别",
+    "疑似封面、扉页或版权页，短文本已保留并列入审计"
+  ],
+  "blocks": [],
+  "ocr_device": null,
+  "gpu_confirmed": false
+}

@@ -1,0 +1,11 @@
+{
+  "page_number": 1,
+  "printed_page": null,
+  "text": "这是原生文本页，直接保留。",
+  "confidence": 1.0,
+  "source": "pdf_text_layer",
+  "warnings": [],
+  "blocks": [],
+  "ocr_device": null,
+  "gpu_confirmed": false
+}

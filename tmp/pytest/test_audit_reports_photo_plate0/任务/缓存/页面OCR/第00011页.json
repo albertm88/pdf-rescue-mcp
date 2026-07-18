@@ -1,0 +1,28 @@
+{
+  "page_number": 11,
+  "printed_page": null,
+  "text": "△1中兽医著作\n4 汉墓出土走马图\n△2清代名兽医\nsowns",
+  "confidence": 0.96,
+  "source": "paddleocr",
+  "warnings": [],
+  "blocks": [
+    {
+      "text": "△1中兽医著作",
+      "confidence": 0.99
+    },
+    {
+      "text": "4 汉墓出土走马图",
+      "confidence": 0.98
+    },
+    {
+      "text": "△2清代名兽医",
+      "confidence": 0.99
+    },
+    {
+      "text": "sowns",
+      "confidence": 0.52
+    }
+  ],
+  "ocr_device": null,
+  "gpu_confirmed": false
+}

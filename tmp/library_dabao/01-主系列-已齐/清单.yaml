@@ -1,0 +1,24 @@
+来源PDF: D:\BaiduNetdiskDownload\dabao\01-主系列-已齐\中国农业百科全书：养蜂卷.pdf
+状态: 完成
+PDF类型: 纯扫描PDF
+引擎: 逐页缓存
+模式: 书籍均衡模式
+输出:
+  状态: 完成
+  任务目录: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐
+  PDF类型: 纯扫描PDF
+  引擎: 逐页缓存
+  清单路径: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐\清单.yaml
+  正文路径: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐\文本\全书.md
+  片段路径: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐\数据\片段.jsonl
+  页面路径: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐\数据\页面.jsonl
+  质量报告路径: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐\数据\质量.json
+  审计报告路径: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐\审计\审计.html
+  OCR设备: 处理器
+  已确认图形处理器计算: false
+  警告:
+  - 本次抽样检查了 20 / 412 页
+  后续步骤: []
+状态文件: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐\状态.json
+失败页: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐\数据\失败页.jsonl
+低置信页: D:\pdf-rescue-mcp\tmp\library_dabao\01-主系列-已齐\数据\低置信页.jsonl
