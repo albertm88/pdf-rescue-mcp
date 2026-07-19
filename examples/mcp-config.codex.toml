@@ -1,0 +1,10 @@
+# Copy this section into ~/.codex/config.toml and replace {{PROJECT_ROOT}}.
+# This template uses the default stdio transport; optional local HTTP is not required.
+[mcp_servers."pdf-rescue"]
+command = "uv"
+args = ["run", "--locked", "--extra", "ocr", "python", "-B", "scripts/start_mcp.py"]
+cwd = "{{PROJECT_ROOT}}"
+
+[mcp_servers."pdf-rescue".env]
+PYTHONUTF8 = "1"
+PYTHONIOENCODING = "utf-8"

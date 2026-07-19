@@ -80,7 +80,9 @@ def _cpu_thread_count(logical_processors: int | None = None) -> int:
     # - 保留2个逻辑核给系统+MCP服务
     # - AMD Ryzen 7 5800H: 8物理核/16逻辑核 -> 最优6-8线程
     physical_cores = count // 2 if count >= 8 else count  # 粗略估算物理核数
-    reserved = 2
+    # Do not reserve both cores on a two-core machine: that would make a
+    # nominally dual-core device run a single OCR thread for no benefit.
+    reserved = 2 if count >= 4 else 0
     optimal = min(physical_cores, 8)  # 上限8线程，避免过度争抢
     return max(1, min(count - reserved, optimal))
 

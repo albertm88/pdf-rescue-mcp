@@ -4,6 +4,9 @@ import html
 import json
 import os
 import re
+import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
@@ -36,6 +39,257 @@ TERM_GLOSSARY_PATH = Path(__file__).with_name("术语词表.yaml")
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _format_duration(seconds: float | int | None) -> str:
+    """把秒数格式化为状态接口可直接展示的中文时长。"""
+    if seconds is None:
+        return "未知"
+    total_seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds_part = divmod(remainder, 60)
+    if hours:
+        return f"{hours}小时{minutes}分{seconds_part}秒"
+    if minutes:
+        return f"{minutes}分{seconds_part}秒"
+    return f"{seconds_part}秒"
+
+
+def _processing_metrics(status: dict) -> dict[str, object]:
+    """从业务层状态文件计算统一的页级指标。
+
+    该函数只读取业务状态，不读取进程、不重启任务；进程资源和恢复信息
+    由监控/优化层在MCP返回中补充，保证三层职责不互相阻塞。
+    """
+    source_pdf = str(status.get("来源PDF") or "")
+    book_name = Path(source_pdf).stem if source_pdf else None
+    try:
+        target_pages = int(status.get("目标页数") or status.get("PDF总页数") or 0)
+    except (TypeError, ValueError):
+        target_pages = 0
+    try:
+        processed_pages = int(status.get("已处理页数") or 0)
+    except (TypeError, ValueError):
+        processed_pages = 0
+    progress = round(processed_pages / target_pages * 100, 1) if target_pages else 0.0
+
+    elapsed_seconds: int | None = None
+    raw_elapsed = status.get("已耗时秒")
+    if raw_elapsed is not None:
+        try:
+            elapsed_seconds = max(0, int(round(float(raw_elapsed))))
+        except (TypeError, ValueError):
+            pass
+    if status.get("开始时间"):
+        try:
+            started_at = datetime.fromisoformat(str(status["开始时间"]))
+            now = datetime.now(started_at.tzinfo) if started_at.tzinfo else datetime.now()
+            live_elapsed = max(0, int(round((now - started_at).total_seconds())))
+            # 运行中的状态文件可能只在页面边界更新，查询时用当前时间补齐这一段。
+            if elapsed_seconds is None or status.get("状态") in {"进行中", "启动中"}:
+                elapsed_seconds = live_elapsed
+        except (TypeError, ValueError):
+            pass
+
+    speed_seconds: float | None = None
+    raw_speed = status.get("平均每页秒")
+    if raw_speed is not None:
+        try:
+            speed_seconds = round(float(raw_speed), 2)
+        except (TypeError, ValueError):
+            pass
+    if speed_seconds is None and elapsed_seconds and processed_pages > 0:
+        speed_seconds = round(elapsed_seconds / processed_pages, 2)
+
+    remaining_seconds: int | None = None
+    raw_remaining = status.get("预计剩余秒")
+    if raw_remaining is not None:
+        try:
+            remaining_seconds = max(0, int(round(float(raw_remaining))))
+        except (TypeError, ValueError):
+            pass
+    if remaining_seconds is None and speed_seconds is not None:
+        remaining_seconds = max(0, int(round(speed_seconds * max(target_pages - processed_pages, 0))))
+
+    return {
+        "书籍名": book_name,
+        "总处理页数": target_pages,
+        "已处理页数": processed_pages,
+        "处理进度": progress,
+        "处理进度文本": f"{progress:.1f}%",
+        "运行时间秒": elapsed_seconds,
+        "运行时间": _format_duration(elapsed_seconds),
+        "剩余时间秒": remaining_seconds,
+        "剩余时间": _format_duration(remaining_seconds),
+        "处理速度": speed_seconds,
+        "处理速度文本": f"{speed_seconds:.2f}秒/页" if speed_seconds is not None else "未知",
+    }
+
+
+class _CancellationRequested(RuntimeError):
+    """Raised at a page boundary when a background worker is asked to stop."""
+
+
+class _WorkerHeartbeat:
+    """A small, independent liveness signal for an externally managed OCR worker.
+
+    Page status only changes after a page has completed.  A difficult page can therefore
+    legitimately take much longer than the normal page cadence.  The supervisor therefore
+    receives two deliberately distinct signals: a frequent liveness heartbeat and durable
+    page-boundary progress.  A live heartbeat with an unchanged page is diagnosable as a
+    stuck page rather than silently being treated as healthy OCR.
+    """
+
+    INTERVAL_SECONDS = 5
+
+    def __init__(self, root: Path, external_stop_flag: object | None = None) -> None:
+        heartbeat_text = os.environ.get("PDF_RESCUE_HEARTBEAT_PATH")
+        cancel_text = os.environ.get("PDF_RESCUE_CANCEL_PATH")
+        self.path = Path(heartbeat_text) if heartbeat_text else None
+        self.cancel_path = Path(cancel_text) if cancel_text else None
+        self.root = root
+        self.external_stop_flag = external_stop_flag
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._state_lock = threading.Lock()
+        self._current_page: int | None = None
+        self._current_page_started_at: str | None = None
+        self._last_completed_page: int | None = None
+        self._last_progress_at: str | None = None
+        self._task_store: object | None = None
+        self._attempt_id: str | None = None
+        task_database = os.environ.get("PDF_RESCUE_TASK_DATABASE")
+        attempt_id = os.environ.get("PDF_RESCUE_TASK_ATTEMPT_ID")
+        if task_database and attempt_id:
+            try:
+                # Imported lazily: direct library use remains independent from the
+                # supervision store, while an isolated MCP worker can emit durable
+                # attempt/page events without importing FastMCP.
+                from .task_store import TaskStore
+
+                self._task_store = TaskStore(task_database)
+                self._attempt_id = attempt_id
+            except Exception:
+                # The business worker must continue when its optional audit database
+                # is temporarily unavailable.  Its file heartbeat remains usable.
+                self._task_store = None
+                self._attempt_id = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.path is not None or self._task_store is not None
+
+    def _record_store(self, method: str, *args: object, **kwargs: object) -> None:
+        store = self._task_store
+        attempt_id = self._attempt_id
+        if store is None or attempt_id is None:
+            return
+        try:
+            getattr(store, method)(attempt_id, *args, **kwargs)
+        except Exception:
+            # A state-store update is advisory to the worker.  The supervisor will
+            # reconcile from the atomic page cache and status file if it misses one.
+            pass
+
+    def set_total_pages(self, total_pages: int) -> None:
+        """Tell the durable supervision store the inspected page count."""
+        store = self._task_store
+        attempt_id = self._attempt_id
+        if store is None or attempt_id is None:
+            return
+        try:
+            attempt = store.get_attempt(attempt_id)
+            store.set_total_pages(attempt.job_id, total_pages)
+        except Exception:
+            pass
+
+    def page_started(self, page_number: int) -> None:
+        """Publish the page watchdog boundary immediately before page work."""
+        started_at = _now()
+        with self._state_lock:
+            self._current_page = page_number
+            self._current_page_started_at = started_at
+        self._record_store("record_page_started", page_number)
+        self._write("运行中")
+
+    def page_completed(self, page: PageRecord) -> None:
+        """Publish durable forward progress only after cache and status commit."""
+        completed_at = _now()
+        with self._state_lock:
+            self._current_page = None
+            self._current_page_started_at = None
+            self._last_completed_page = page.page_number
+            self._last_progress_at = completed_at
+        self._record_store(
+            "record_page_completed",
+            page.page_number,
+            result={
+                "source": page.source,
+                "confidence": round(float(page.confidence), 4),
+                "has_text": bool(page.text.strip()),
+            },
+        )
+        self._write("运行中")
+
+    def page_failed(self, page_number: int, error_type: str) -> None:
+        """Record an OCR failure boundary without exposing exception text/secrets."""
+        completed_at = _now()
+        with self._state_lock:
+            self._current_page = None
+            self._current_page_started_at = None
+            self._last_progress_at = completed_at
+        self._record_store("record_page_failed", page_number, error={"kind": error_type})
+        self._write("运行中")
+
+    def is_set(self) -> bool:
+        external_is_set = getattr(self.external_stop_flag, "is_set", None)
+        return bool(
+            (callable(external_is_set) and external_is_set())
+            or (self.cancel_path is not None and self.cancel_path.exists())
+        )
+
+    def _write(self, state: str) -> None:
+        with self._state_lock:
+            current_page = self._current_page
+            current_page_started_at = self._current_page_started_at
+            last_completed_page = self._last_completed_page
+            last_progress_at = self._last_progress_at
+        payload = {
+            "状态": state,
+            "进程ID": os.getpid(),
+            "任务目录": str(self.root),
+            "更新时间": _now(),
+            "当前页": current_page,
+            "当前页开始时间": current_page_started_at,
+            "最后完成页": last_completed_page,
+            "最后进度时间": last_progress_at,
+        }
+        self._record_store("record_heartbeat", worker_pid=os.getpid())
+        if self.path is None:
+            return
+        try:
+            _write_json(self.path, payload)
+        except OSError:
+            # A heartbeat must never make OCR fail just because its monitor folder is unavailable.
+            pass
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._write("运行中")
+
+        def _loop() -> None:
+            while not self._stop.wait(self.INTERVAL_SECONDS):
+                self._write("运行中")
+
+        self._thread = threading.Thread(target=_loop, daemon=True, name="ocr-heartbeat")
+        self._thread.start()
+
+    def finish(self, state: str) -> None:
+        if not self.enabled:
+            return
+        self._stop.set()
+        self._write(state)
 
 
 def _read_term_glossary() -> tuple[list[dict], str | None]:
@@ -154,15 +408,61 @@ def _dpi_for_mode(mode: str) -> int:
 
 
 def _write_jsonl(path: Path, records: Iterable[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    content = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    _write_text_atomically(path, content)
 
 
 def _write_json(path: Path, payload: dict) -> None:
+    _write_text_atomically(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _write_text_atomically(path: Path, content: str) -> None:
+    """Commit a complete UTF-8 file in one replace operation.
+
+    Status, cache and audit records are read by another process while a worker is
+    running.  A unique sibling temporary file avoids readers observing a half-written
+    JSON document and avoids colliding with an old worker during recovery.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_name = handle.name
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                Path(temporary_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _read_json_with_retry(path: Path, *, attempts: int = 3) -> dict:
+    """Read a JSON object through a concurrent legacy writer without false failure."""
+    last_error: Exception | None = None
+    for index in range(max(1, attempts)):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError(f"JSON对象必须是字典：{path}")
+            return payload
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if index + 1 < max(1, attempts):
+                time.sleep(0.02)
+    assert last_error is not None
+    raise last_error
 
 
 def _cleanup_ocr_text(text: str) -> str:
@@ -1578,7 +1878,7 @@ def _load_cached_page(cache_dir: Path, page_number: int) -> PageRecord | None:
     path = _cache_path(cache_dir, page_number)
     if not path.exists():
         return None
-    return PageRecord.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    return PageRecord.model_validate(_read_json_with_retry(path))
 
 
 def _write_cached_page(cache_dir: Path, page: PageRecord) -> None:
@@ -1640,6 +1940,20 @@ def _write_status(
         payload["是否抽样"] = is_sample
     if mode:
         payload["模式"] = zh_data(mode)
+    # 业务层把页级指标写入状态文件，CLI、批量管理器和MCP查询共享同一来源。
+    metrics = _processing_metrics(payload)
+    payload.update(
+        {
+            "书籍名": metrics["书籍名"],
+            "总处理页数": metrics["总处理页数"],
+            "处理进度": metrics["处理进度"],
+            "处理进度文本": metrics["处理进度文本"],
+            "运行时间": metrics["运行时间"],
+            "剩余时间": metrics["剩余时间"],
+            "处理速度": metrics["处理速度"],
+            "处理速度文本": metrics["处理速度文本"],
+        }
+    )
     _write_json(path, payload)
 
 
@@ -1794,6 +2108,7 @@ def _extract_ocr_pages_resumable(
     direct_pages: dict[int, PageRecord] | None = None,
     password: str | None = None,
     progress_callback: "Callable[[int, int, float, str | None], None] | None" = None,
+    stop_flag: object | None = None,
 ) -> tuple[str, list[PageRecord], list[dict], list[dict]]:
     if resume:
         cached_pages = [_load_cached_page(cache_dir, page_number) for page_number in range(1, target_pages + 1)]
@@ -1832,7 +2147,18 @@ def _extract_ocr_pages_resumable(
                     ocr_device=next((page.ocr_device for page in pages if page.ocr_device), "缓存"),
                     gpu_confirmed=any(page.gpu_confirmed for page in pages),
                 )
+                heartbeat = stop_flag if isinstance(stop_flag, _WorkerHeartbeat) else None
+                if heartbeat is not None:
+                    # A resumed attempt that only assembles an already-complete cache
+                    # still needs a durable page snapshot for status/iteration reads.
+                    for page in pages:
+                        heartbeat.page_started(page.page_number)
+                        heartbeat.page_completed(page)
                 return "page_cache", pages, [], low_reports
+
+    stop_requested = getattr(stop_flag, "is_set", None)
+    if callable(stop_requested) and stop_requested():
+        raise _CancellationRequested("OCR任务在初始化前已收到停止请求")
 
     engine_name, adapter = create_ocr_adapter()
     ocr_device = str(getattr(adapter, "device", "cpu"))
@@ -1873,6 +2199,32 @@ def _extract_ocr_pages_resumable(
         return medium_adapter_cache
 
     for page_number in range(1, target_pages + 1):
+        if callable(stop_requested) and stop_requested():
+            _write_status(
+                status_path,
+                source_pdf=pdf_path,
+                status="已取消",
+                target_pages=target_pages,
+                processed_pages=len(pages),
+                text_pages=sum(1 for item in pages if item.text.strip()),
+                blank_pages=sum(1 for item in pages if item.source == "blank_page"),
+                failed_pages=len(failed_reports),
+                low_confidence_pages=len(low_reports),
+                engine=reported_engine,
+                total_pages=total_pages,
+                is_sample=is_sample,
+                started_at=started_at,
+                mode=mode,
+                ocr_device=ocr_device,
+                gpu_confirmed=gpu_confirmed,
+            )
+            raise _CancellationRequested("OCR任务已在页边界停止")
+        # This is intentionally before loading a cache or calling OCR.  It gives the
+        # supervisor an unambiguous page-level watchdog marker even when the renderer
+        # or native OCR library wedges before it can produce a cache file.
+        heartbeat = stop_flag if isinstance(stop_flag, _WorkerHeartbeat) else None
+        if heartbeat is not None:
+            heartbeat.page_started(page_number)
         cached = _load_cached_page(cache_dir, page_number) if resume else None
         cache_dirty = False
         pending_failure_report: dict | None = None
@@ -1903,7 +2255,7 @@ def _extract_ocr_pages_resumable(
                     "错误类型": type(exc).__name__,
                     "错误信息": str(exc),
                 }
-            cache_dirty = True
+                cache_dirty = True
 
         if _needs_low_confidence_review(page) and (
             not _already_upgraded(page) or _needs_rotation_review(page)
@@ -1951,6 +2303,14 @@ def _extract_ocr_pages_resumable(
             ocr_device=ocr_device,
             gpu_confirmed=gpu_confirmed,
         )
+        # The cache, failure/low-confidence records, and business status have all
+        # committed atomically at this point.  Only now is it correct to advance
+        # the durable supervision progress cursor.
+        if heartbeat is not None:
+            if pending_failure_report and not page.text.strip():
+                heartbeat.page_failed(page_number, str(pending_failure_report["错误类型"]))
+            else:
+                heartbeat.page_completed(page)
         if progress_callback is not None:
             now = datetime.now()
             elapsed = max(0.0, (now - started_at).total_seconds()) if started_at else 0.0
@@ -2127,7 +2487,51 @@ def export_page_image_evidence(
     }
 
 
-def _status_freshness(status: dict, stalled_after_seconds: int) -> dict:
+def _worker_heartbeat_freshness(root: Path, stalled_after_seconds: int) -> dict:
+    """Read the worker heartbeat without treating an incomplete write as a task failure."""
+    path = root / "后台任务心跳.json"
+    if not path.exists():
+        return {
+            "存在": False,
+            "活跃": False,
+            "距上次心跳秒数": None,
+            "进程ID": None,
+            "当前页": None,
+            "最后完成页": None,
+            "最后进度时间": None,
+        }
+    try:
+        payload = _read_json_with_retry(path)
+        age = max(0, round((datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)).total_seconds()))
+        active = payload.get("状态") == "运行中" and age < stalled_after_seconds
+        return {
+            "存在": True,
+            "活跃": active,
+            "距上次心跳秒数": age,
+            "进程ID": payload.get("进程ID"),
+            "状态": payload.get("状态"),
+            "当前页": payload.get("当前页"),
+            "当前页开始时间": payload.get("当前页开始时间"),
+            "最后完成页": payload.get("最后完成页"),
+            "最后进度时间": payload.get("最后进度时间"),
+        }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {
+            "存在": True,
+            "活跃": False,
+            "距上次心跳秒数": None,
+            "进程ID": None,
+            "当前页": None,
+            "最后完成页": None,
+            "最后进度时间": None,
+        }
+
+
+def _status_freshness(
+    status: dict,
+    stalled_after_seconds: int,
+    worker_heartbeat: dict | None = None,
+) -> dict:
     updated_text = str(status.get("更新时间") or "")
     seconds_since_update: int | None = None
     if updated_text:
@@ -2140,16 +2544,18 @@ def _status_freshness(status: dict, stalled_after_seconds: int) -> dict:
     state = str(status.get("状态") or "未知")
     target_pages = int(status.get("目标页数") or 0)
     processed_pages = int(status.get("已处理页数") or 0)
+    worker_active = bool((worker_heartbeat or {}).get("活跃"))
     suspected_stalled = bool(
-        state == "进行中"
+        state in {"进行中", "启动中"}
         and processed_pages < target_pages
         and seconds_since_update is not None
         and seconds_since_update >= stalled_after_seconds
+        and not worker_active
     )
     if suspected_stalled:
         runtime_state = "疑似中断"
-    elif state == "进行中":
-        runtime_state = "活跃"
+    elif state in {"进行中", "启动中"}:
+        runtime_state = "活跃（工作进程心跳）" if worker_active else "活跃"
     else:
         runtime_state = state
     return {
@@ -2169,19 +2575,47 @@ def read_job_status(job_dir: str | Path, *, stalled_after_seconds: int = 600) ->
     if not status_path.exists():
         raise FileNotFoundError(str(status_path))
 
-    status = json.loads(status_path.read_text(encoding="utf-8"))
+    try:
+        status = _read_json_with_retry(status_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        # A legacy/non-atomic external writer may be replacing this file at the
+        # instant a client polls.  Return a retriable state rather than making the
+        # MCP request fail and incorrectly suggesting that OCR itself has failed.
+        return {
+            "任务目录": str(root),
+            "状态文件": str(status_path),
+            "状态新鲜度": {"运行判断": "状态刷新中", "疑似中断": False},
+            "工作进程心跳": _worker_heartbeat_freshness(root, stalled_after_seconds),
+            "任务指标": {},
+            "状态": {"状态": "刷新中", "读取错误": type(exc).__name__},
+            "低置信页": [],
+            "失败页": [],
+        }
     low_pages: list[dict] = []
     failed_pages: list[dict] = []
     if low_path.exists():
-        low_pages = [json.loads(line) for line in low_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        try:
+            low_pages = [
+                json.loads(line)
+                for line in low_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            low_pages = []
     if failed_path.exists():
-        failed_pages = [
-            json.loads(line) for line in failed_path.read_text(encoding="utf-8").splitlines() if line.strip()
-        ]
+        try:
+            failed_pages = [
+                json.loads(line)
+                for line in failed_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            failed_pages = []
 
     target_pages = int(status.get("目标页数") or 0)
     processed_pages = int(status.get("已处理页数") or 0)
     progress = round(processed_pages / target_pages, 4) if target_pages else 0.0
+    worker_heartbeat = _worker_heartbeat_freshness(root, stalled_after_seconds)
     return {
         "任务目录": str(root),
         "状态文件": str(status_path),
@@ -2189,7 +2623,9 @@ def read_job_status(job_dir: str | Path, *, stalled_after_seconds: int = 600) ->
         "低置信页文件": str(low_path) if low_path.exists() else None,
         "失败页文件": str(failed_path) if failed_path.exists() else None,
         "进度": progress,
-        "状态新鲜度": _status_freshness(status, stalled_after_seconds),
+        "状态新鲜度": _status_freshness(status, stalled_after_seconds, worker_heartbeat),
+        "工作进程心跳": worker_heartbeat,
+        "任务指标": _processing_metrics(status),
         "状态": status,
         "低置信页": low_pages,
         "失败页": failed_pages,
@@ -2421,6 +2857,7 @@ def extract_book_text(
     resume: bool = True,
     password: str | None = None,
     progress_callback: Callable[[int, int, float, str | None], None] | None = None,
+    stop_flag: object | None = None,
 ) -> ExtractionResult:
     started_at = datetime.now()
     pdf_path = ensure_path(path)
@@ -2431,6 +2868,8 @@ def extract_book_text(
         else ((ensure_path(configured_root) if configured_root else pdf_path.parent / "pdf_rescue_output")
               / f"{_safe_name(pdf_path)}-rescue-result")
     )
+    heartbeat = _WorkerHeartbeat(root, external_stop_flag=stop_flag)
+    heartbeat.start()
     try:
         inspection = inspect_pdf_text_layer(pdf_path, max_pages=max_pages, password=password)
     except Exception as exc:
@@ -2484,6 +2923,7 @@ def extract_book_text(
     target_pages = min(inspection.page_count, max_pages) if max_pages else inspection.page_count
     is_sample = target_pages < inspection.page_count
     dpi = _dpi_for_mode(mode)
+    heartbeat.set_total_pages(target_pages)
     history_start = append_history_event(
         root,
         "开始处理",
@@ -2513,6 +2953,7 @@ def extract_book_text(
         if inspection.pdf_type == PdfType.SEARCHABLE_SCANNED:
             warnings.append("正在复用现有OCR文本层；请查看质量报告中的扫描页风险。")
         for page in pages:
+            heartbeat.page_started(page.page_number)
             page.warnings.extend(_page_quality_warnings(page))
             if page.source != "blank_page" and (
                 page.confidence < LOW_CONFIDENCE_THRESHOLD or not page.text.strip()
@@ -2553,10 +2994,16 @@ def extract_book_text(
                     direct_pages=hybrid_direct_pages or None,
                     password=password,
                     progress_callback=progress_callback,
+                    stop_flag=heartbeat,
                 )
                 ocr_devices = {page.ocr_device for page in pages if page.ocr_device}
                 ocr_device = "gpu" if "gpu" in ocr_devices else (next(iter(ocr_devices), None))
                 gpu_confirmed = any(page.gpu_confirmed for page in pages)
+            except _CancellationRequested:
+                status = "cancelled"
+                engine = "cancelled"
+                warnings.append("OCR任务已收到停止请求，已在安全页边界停止；可用恢复任务继续。")
+                next_steps.append("如需继续，请使用恢复任务从逐页缓存断点续传。")
             except Exception:
                 status = "needs_ocr_engine"
                 engine = "none"
@@ -2619,7 +3066,7 @@ def extract_book_text(
     _write_status(
         status_path,
         source_pdf=pdf_path,
-        status="完成" if status == "ok" else "未完成",
+        status="完成" if status == "ok" else ("已取消" if status == "cancelled" else "未完成"),
         target_pages=target_pages,
         processed_pages=len(pages),
         text_pages=sum(1 for item in pages if item.text.strip()),
@@ -2634,6 +3081,11 @@ def extract_book_text(
         ocr_device=ocr_device,
         gpu_confirmed=gpu_confirmed,
     )
+    if use_direct:
+        # Direct-text pages have no per-page status writes.  Advance their
+        # supervision cursor only after the final authoritative status snapshot.
+        for page in pages:
+            heartbeat.page_completed(page)
 
     result = ExtractionResult(
         status=status,
@@ -2687,6 +3139,7 @@ def extract_book_text(
             "审计报告": str(audit_path),
         },
     )
+    heartbeat.finish("已完成" if status == "ok" else ("已取消" if status == "cancelled" else "未完成"))
     return result
 
 
@@ -2742,7 +3195,10 @@ def resume_job(
     selected_mode = mode or _mode_from_status(status.get("模式"))
     result = extract_book_text(
         source_path,
-        output_dir=root,
+        # ``extract_book_text`` derives a ``*-rescue-result`` child from its
+        # output root.  Reuse this job's parent so a direct library resume does
+        # not create ``job-rescue-result/job-rescue-result`` nesting.
+        output_dir=root.parent,
         mode=selected_mode,
         max_pages=max_pages,
         resume=True,

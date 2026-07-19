@@ -2,12 +2,16 @@
 
 A local MCP service and CLI tool for Chinese book PDFs, supporting OCR text extraction from scanned PDFs, quality auditing, resume from breakpoints, and batch processing.
 
+Current release line: **1.0.0**.
+
+The detailed Chinese runtime boundary, recovery state machine, and portability policy are in [the 1.0 architecture document](docs/ARCHITECTURE_1.0.md).
+
 [中文](README.md) | English
 
 ## Features
 
 - **One-Click Rescue**: Single `rescue_pdf` tool automates the full pipeline: diagnose → plan → extract → audit
-- **Three-Layer Monitoring**: Business layer (subprocess isolation) + Monitoring layer (10s heartbeat) + Optimization layer (auto-restart on stall)
+- **Three-Layer Runtime**: Business layer (isolated OCR and atomic page cache) + Supervision layer (SQLite lease, heartbeat/page-progress watchdog, portable process control) + Iteration layer (auditable advisory plans only)
 - **Batch Processing**: Background thread iterates books sequentially, MCP server stays responsive with real-time progress
 - **Resume from Breakpoints**: Per-page caching, auto-resume from last checkpoint after interruption
 - **Quality Auditing**: Low-confidence page detection, failed page logging, page evidence export
@@ -59,7 +63,7 @@ A local MCP service and CLI tool for Chinese book PDFs, supporting OCR text extr
 
 - Python ≥ 3.11
 - [uv](https://docs.astral.sh/uv/) package manager
-- Windows 10/11 (primary tested platform) or Linux
+- Windows, Linux, or macOS for the Python core, supervision, and process control. Check `run_health_check` for the OCR/GPU backend available on the local machine.
 
 ### Setup
 
@@ -75,25 +79,52 @@ uv sync --extra ocr
 uv sync --extra ocr-gpu
 ```
 
-### VS Code MCP Configuration
+### Cross-client MCP stdio configuration
 
-Add to `.vscode/mcp.json`:
+The server defaults to standard **stdio** MCP and OCR runs in a separate worker process. A localhost-only Streamable HTTP mode is optional, but none of the templates below depend on HTTP or SSE. Install the CPU OCR extra from the project root first:
 
-```json
-{
-  "servers": {
-    "中文PDF书籍救援": {
-      "command": "uv",
-      "args": ["run", "--extra", "ocr", "--extra", "dev", "python", "-B", "scripts/start_mcp.py"],
-      "cwd": "${workspaceFolder}",
-      "env": {
-        "PYTHONUTF8": "1",
-        "PYTHONIOENCODING": "utf-8"
-      }
-    }
-  }
-}
+```bash
+uv sync --extra ocr
 ```
+
+All checked-in launch configurations use `uv run --locked --extra ocr python -B scripts/start_mcp.py`. This enables CPU OCR only and does **not** install GPU dependencies by default. For NVIDIA GPU acceleration, explicitly run `uv sync --extra ocr-gpu` and adjust the local environment as needed.
+
+| Client | Template | Configuration shape |
+|--------|----------|---------------------|
+| VS Code | `.vscode/mcp.json`, `examples/mcp-config.vscode.json` | `servers` plus `type: "stdio"` |
+| Claude Desktop / Cursor | `examples/mcp-config.claude-cursor.json` | standard `mcpServers` JSON |
+| Codex | `examples/mcp-config.codex.toml` | merge the `mcp_servers` section into `~/.codex/config.toml` |
+| AnythingLLM | `examples/mcp-config.anythingllm.json` | standard `mcpServers` JSON; `autoStart: false` avoids starting OCR with the application |
+| TRAE | `examples/mcp-config.trae.json` → `<project-root>/.trae/mcp.json` | standard `mcpServers` stdio JSON; enable project-level MCP in Settings > MCP first |
+
+Replace `{{PROJECT_ROOT}}` in the templates with the **absolute** project root. Do not commit a filled-in local configuration. The VS Code workspace configuration uses `${workspaceFolder}` instead.
+
+Generate a client configuration with an absolute `cwd` so that clients launched from an unrelated working directory can still locate `scripts/start_mcp.py`:
+
+```bash
+# JSON: generic / claude / cursor / trae / vscode / anythingllm
+uv run --locked --extra ocr python scripts/generate_mcp_config.py \
+  --client anythingllm --output <local-config-path>
+
+# TOML: merge the generated section into ~/.codex/config.toml
+uv run --locked --extra ocr python scripts/generate_mcp_config.py \
+  --client codex --output <local-codex-snippet-path>
+```
+
+`--runner auto` prefers `uv`; `--runner python` and Windows `--runner py` are also available. Claude, Cursor, AnythingLLM, and TRAE use the same stdio command shown in their template; TRAE project configuration lives at `.trae/mcp.json`. If you choose the optional HTTP mode, bind it to localhost only and first confirm Streamable HTTP support in that client version.
+
+### Optional: local Streamable HTTP
+
+Use this only for an MCP host that cannot launch a local stdio process but does support Streamable HTTP. It is disabled by default and only permits a loopback bind so local PDF access is not exposed on the LAN:
+
+```powershell
+$env:PDF_RESCUE_MCP_TRANSPORT = "streamable-http"
+$env:PDF_RESCUE_MCP_HOST = "127.0.0.1"
+$env:PDF_RESCUE_MCP_PORT = "8765"
+uv run --locked --extra ocr python -B scripts/start_mcp.py
+```
+
+Use `http://127.0.0.1:8765/mcp` as the MCP URL. For cross-machine access, put the service behind an authenticated MCP gateway; this server will not listen on unauthenticated `0.0.0.0`.
 
 ## MCP Tools Reference
 
@@ -105,7 +136,9 @@ Add to `.vscode/mcp.json`:
 | `extract_book_text` | Extract book text, runs in background subprocess, returns task directory immediately. |
 | `get_job_status` | Query task progress (pages, speed, ETA, thread health). |
 | `resume_job` | Resume interrupted task (breakpoint continuation). |
+| `cancel_job` | Request a safe page-boundary stop without blocking MCP. |
 | `audit_job_quality` | Quality audit (low-confidence pages, failed pages, split heading detection). |
+| `get_iteration_plan` | Produce a versioned, advisory-only quality/resource improvement plan. |
 
 ### Batch Processing
 
@@ -183,13 +216,19 @@ uv run python -m pdf_rescue_mcp.cli 书库提取 <library-dir> --output-dir <out
 | `book-quality` | 300 | High-quality output | ~30-90s/page |
 | `book-forensic` | 300+ | Forensic level, low-quality scans | ~60-180s/page |
 
-## Three-Layer Monitoring
+## 1.0 Three-Layer Runtime
 
 | Layer | Mechanism | Parameters |
 |-------|-----------|------------|
-| **Business** | Subprocess isolation (`subprocess.Popen`), OCR crashes don't affect MCP server | - |
-| **Monitor** | Watcher thread every 10s: subprocess liveness (`poll()`) + status file freshness (`mtime`) | `WATCH_INTERVAL=10s` |
-| **Optimize** | Page timeout 180s → `terminate()` → downgrade to `book-fast` + restart once | `PAGE_TIMEOUT=180s`, `MAX_AUTO_RESTART=1` |
+| **Business** | Isolated OCR, per-page cache, atomic status/JSONL commits | progress, speed, ETA, quality evidence |
+| **Supervision** | Local SQLite WAL task ledger, fencing lease, liveness + page-progress signals, safe `psutil` process-tree cleanup | `WATCH_INTERVAL=5s`, `HEARTBEAT_TIMEOUT=90s`, `PROGRESS_TIMEOUT=600s` |
+| **Iteration** | Versioned plans generated from audit results and supervision events; never live self-modifying | `get_iteration_plan`, manual approval required |
+
+OCR routes always run in an isolated worker even when a client asks for foreground execution, so stdio/HTTP MCP adapters remain responsive across VS Code, TRAE, Codex, AnythingLLM, and other compatible hosts.
+
+### Cross-platform runtime state
+
+Long-lived supervision state uses OS-standard per-user directories: `%APPDATA%` / `%LOCALAPPDATA%` on Windows, `~/Library/...` on macOS, and XDG directories on Linux. Set `PDF_RESCUE_RUNTIME_ROOT` to an absolute path for a portable installation. Keep the SQLite task database on a local disk, not a network or sync share.
 
 ## Output Structure
 

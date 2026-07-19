@@ -32,16 +32,18 @@ def test_platform_mcp_configs_use_portable_locked_runner() -> None:
 
     for filename in configs:
         config = json.loads((root / "examples" / filename).read_text(encoding="utf-8"))
-        server = config["mcpServers"]["中文PDF书籍救援"]
+        server = config["mcpServers"]["pdf-rescue"]
         assert server["command"] == "uv"
         assert server["args"] == [
             "run",
             "--locked",
+            "--extra",
+            "ocr",
             "python",
             "-B",
             "scripts/start_mcp.py",
         ]
-        assert server["cwd"] == "."
+        assert server["cwd"] == "{{PROJECT_ROOT}}"
         assert ":" not in server["command"]
         assert "\\" not in server["command"]
         assert server["env"]["PYTHONUTF8"] == "1"

@@ -28,6 +28,7 @@ from pdf_rescue_mcp.book_pipeline import (
     _write_status,
 )
 from pdf_rescue_mcp.models import PageRecord
+from pdf_rescue_mcp.task_store import TaskStore
 
 
 class FakeAdapter:
@@ -356,6 +357,13 @@ def test_status_includes_runtime_estimates(tmp_path: Path) -> None:
     assert status["已耗时秒"] >= 40
     assert status["平均每页秒"] >= 20
     assert status["预计剩余秒"] >= 160
+    assert status["书籍名"] == "书"
+    assert status["总处理页数"] == 10
+    assert status["处理进度"] == 20.0
+    assert status["处理进度文本"] == "20.0%"
+    assert status["处理速度"] >= 20
+    assert status["运行时间"].endswith("秒")
+    assert status["剩余时间"].endswith("秒")
     assert status["PDF总页数"] == 10
     assert status["是否抽样"] is False
     assert status["模式"] == "书籍高质量模式"
@@ -383,6 +391,73 @@ def test_status_marks_stale_running_job_as_suspected_stalled(tmp_path: Path) -> 
 
     assert result["状态新鲜度"]["疑似中断"] is True
     assert result["状态新鲜度"]["运行判断"] == "疑似中断"
+
+
+def test_fresh_worker_heartbeat_prevents_false_stall_for_a_slow_page(tmp_path: Path) -> None:
+    status_path = tmp_path / "状态.json"
+    _write_status(
+        status_path,
+        source_pdf=Path("书.pdf"),
+        status="进行中",
+        target_pages=10,
+        processed_pages=2,
+        text_pages=2,
+        blank_pages=0,
+        failed_pages=0,
+        low_confidence_pages=0,
+        engine="paddleocr",
+    )
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["更新时间"] = (datetime.now() - timedelta(minutes=20)).isoformat(timespec="seconds")
+    status_path.write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+    (tmp_path / "后台任务心跳.json").write_text(
+        json.dumps({"状态": "运行中", "进程ID": 97531}, ensure_ascii=False), encoding="utf-8"
+    )
+
+    result = read_job_status(tmp_path, stalled_after_seconds=600)
+
+    assert result["状态新鲜度"]["疑似中断"] is False
+    assert result["状态新鲜度"]["运行判断"] == "活跃（工作进程心跳）"
+    assert result["工作进程心跳"]["进程ID"] == 97531
+    assert result["任务指标"]["书籍名"] == "书"
+    assert result["任务指标"]["总处理页数"] == 10
+    assert result["任务指标"]["处理进度"] == 20.0
+
+
+def test_worker_heartbeat_publishes_page_boundaries_and_durable_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "runtime" / "tasks.sqlite3"
+    store = TaskStore(database)
+    task = store.claim_task(
+        idempotency_key="heartbeat-book",
+        source_path=tmp_path / "书.pdf",
+        output_root=tmp_path / "out",
+        mode="book-balanced",
+    ).task
+    attempt = store.start_attempt(task.job_id, supervisor_id="test")
+    heartbeat_path = tmp_path / "任务" / "后台任务心跳.json"
+    monkeypatch.setenv("PDF_RESCUE_HEARTBEAT_PATH", str(heartbeat_path))
+    monkeypatch.setenv("PDF_RESCUE_TASK_DATABASE", str(database))
+    monkeypatch.setenv("PDF_RESCUE_TASK_ATTEMPT_ID", attempt.attempt_id)
+    heartbeat = book_pipeline._WorkerHeartbeat(tmp_path / "任务")
+    page = PageRecord(page_number=1, text="已确认文本", confidence=0.97, source="paddleocr")
+
+    heartbeat.start()
+    heartbeat.set_total_pages(1)
+    heartbeat.page_started(1)
+    running = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+    heartbeat.page_completed(page)
+    heartbeat.finish("已完成")
+    finished = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+
+    assert running["当前页"] == 1
+    assert running["最后完成页"] is None
+    assert finished["当前页"] is None
+    assert finished["最后完成页"] == 1
+    assert store.get_task(task.job_id).completed_pages == 1
+    assert store.get_task(task.job_id).last_completed_page == 1
 
 
 def test_resume_job_reuses_stalled_job_configuration(

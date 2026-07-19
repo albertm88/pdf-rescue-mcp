@@ -1,9 +1,34 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 import pdf_rescue_mcp.runtime as runtime
 from pdf_rescue_mcp.models import ToolStatus
+
+
+def test_command_output_tolerates_windows_legacy_bytes() -> None:
+    assert runtime._decode_command_output("version") == "version"
+    assert runtime._decode_command_output(b"version") == "version"
+    assert runtime._decode_command_output("版本".encode("gb18030")) == "版本"
+
+
+def test_command_status_captures_bytes_without_text_decoder_traceback(monkeypatch) -> None:
+    monkeypatch.setattr(runtime.shutil, "which", lambda _candidate: "legacy-tool.cmd")
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="版本 1.0".encode("gb18030"),
+            stderr=b"",
+        ),
+    )
+
+    status = runtime._command_status("legacy-tool", ["legacy-tool"], ["--version"])
+
+    assert status.available is True
+    assert status.version == "版本 1.0"
 
 
 def test_paddle_cpu_build_is_not_reported_as_gpu_ready(monkeypatch) -> None:

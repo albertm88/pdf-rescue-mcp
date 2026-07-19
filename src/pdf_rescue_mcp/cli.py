@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -15,7 +16,6 @@ from .book_pipeline import (
     read_job_status,
     resume_job,
 )
-from .history import collect_processing_history, share_processing_history
 from .library_pipeline import batch_extract_library, scan_pdf_library
 from .pdf_inspector import inspect_pdf_text_layer
 from .planner import plan_pdf_job
@@ -23,17 +23,93 @@ from .runtime import doctor_runtime
 from .stdio_encoding import configure_utf8_stdio
 from .zh import zh_data
 
+
+def _translate_click_help(text: str) -> str:
+    """Keep CLI help stable and readable when Click/Typer upgrades."""
+    replacements = {
+        "Show this message and exit.": "显示此帮助并退出。",
+        "[required]": "[必填]",
+        "default: book-balanced": "默认值：书籍均衡",
+        "default: resume": "默认值：继续",
+        "default: no-resume": "默认值：不继续",
+        "default:": "默认值：",
+    }
+    for original, translated in replacements.items():
+        text = text.replace(original, translated)
+    return text
+
+
+def _write_chinese_section(formatter, heading: str, rows: list[tuple[str, str]]) -> None:
+    if not rows:
+        return
+    formatter.write_paragraph()
+    formatter.write(f"{'':>{formatter.current_indent}}{heading}：\n")
+    formatter.indent()
+    try:
+        formatter.write_dl(rows)
+    finally:
+        formatter.dedent()
+
+
+class _ChineseHelpMixin:
+    """Small Click-format boundary; command behavior remains ordinary Typer."""
+
+    def get_help_option_names(self, ctx):
+        names = super().get_help_option_names(ctx)
+        if "--帮助" not in names:
+            names.append("--帮助")
+        return names
+
+    def format_usage(self, ctx, formatter) -> None:
+        pieces = " ".join(self.collect_usage_pieces(ctx)).replace("OPTIONS", "选项")
+        formatter.write_usage(ctx.command_path, pieces, prefix="用法：")
+
+    def format_options(self, ctx, formatter) -> None:
+        arguments: list[tuple[str, str]] = []
+        options: list[tuple[str, str]] = []
+        for parameter in self.get_params(ctx):
+            record = parameter.get_help_record(ctx)
+            if record is None:
+                continue
+            translated = (record[0], _translate_click_help(record[1]))
+            if parameter.param_type_name == "argument":
+                arguments.append(translated)
+            elif parameter.param_type_name == "option":
+                options.append(translated)
+        _write_chinese_section(formatter, "参数", arguments)
+        _write_chinese_section(formatter, "选项", options)
+
+
+class ChineseTyperCommand(_ChineseHelpMixin, typer.core.TyperCommand):
+    pass
+
+
+class ChineseTyperGroup(_ChineseHelpMixin, typer.core.TyperGroup):
+    def format_options(self, ctx, formatter) -> None:
+        super().format_options(ctx, formatter)
+        self.format_commands(ctx, formatter)
+
+    def format_commands(self, ctx, formatter) -> None:
+        rows: list[tuple[str, str]] = []
+        for subcommand in self.list_commands(ctx):
+            command = self.get_command(ctx, subcommand)
+            if command is not None and not command.hidden:
+                rows.append((subcommand, command.get_short_help_str(formatter.width - 6 - len(subcommand))))
+        _write_chinese_section(formatter, "命令", rows)
+
+
 app = typer.Typer(
     add_completion=False,
     rich_markup_mode=None,
     help="PDF 书籍救援工具",
+    cls=ChineseTyperGroup,
 )
 
 configure_utf8_stdio()
 console = Console()
 
 
-@app.command("体检")
+@app.command("体检", cls=ChineseTyperCommand)
 def doctor(
     as_json: bool = typer.Option(False, "--json", help="输出完整 JSON 数据"),
 ):
@@ -48,7 +124,7 @@ def doctor(
         console.print(f"- {zh_data(note)}")
 
 
-@app.command("检查")
+@app.command("检查", cls=ChineseTyperCommand)
 def inspect(
     path: Path,
     max_pages: Optional[int] = typer.Option(None, "--max-pages", help="检查前 N 页"),
@@ -65,7 +141,7 @@ def inspect(
     console.print(f"总页数: {result.page_count}")
 
 
-@app.command("规划")
+@app.command("规划", cls=ChineseTyperCommand)
 def plan(
     path: Path,
     target_quality: str = typer.Option("balanced", "--quality", help="目标质量"),
@@ -82,7 +158,7 @@ def plan(
     console.print(f"引擎: {zh_data(result.get('engine', ''))}")
 
 
-@app.command("提取")
+@app.command("提取", cls=ChineseTyperCommand)
 def extract(
     path: Path,
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", help="输出目录"),
@@ -99,7 +175,7 @@ def extract(
         mode=mode,
         max_pages=max_pages,
         resume=resume,
-        password=password,
+        password=password or os.environ.get("PDF_RESCUE_PASSWORD"),
     )
     if as_json:
         console.print(json.dumps(zh_data(result), ensure_ascii=False, indent=2))
@@ -111,7 +187,7 @@ def extract(
         console.print(f"- {zh_data(step)}")
 
 
-@app.command("状态")
+@app.command("状态", cls=ChineseTyperCommand)
 def status(
     job_dir: Path,
     stalled_after_seconds: int = typer.Option(600, "--stalled-after", help="卡死判定秒数"),
@@ -127,7 +203,7 @@ def status(
     console.print(f"进度: {state.get('已处理页数', 0)} / {state.get('目标页数', 0)}")
 
 
-@app.command("恢复")
+@app.command("恢复", cls=ChineseTyperCommand)
 def resume_cmd(
     job_dir: Path,
     mode: Optional[str] = typer.Option(None, "--mode", help="覆盖识别模式"),
@@ -150,7 +226,7 @@ def resume_cmd(
     console.print(f"结果: {result}")
 
 
-@app.command("质检")
+@app.command("质检", cls=ChineseTyperCommand)
 def audit_quality(
     job_dir: Path,
     max_issues: int = typer.Option(80, "--max-issues", help="最大问题数"),
@@ -165,7 +241,7 @@ def audit_quality(
     console.print(f"已巡检: {result.get('已巡检页数', 0)} 页")
 
 
-@app.command("页面证据")
+@app.command("页面证据", cls=ChineseTyperCommand)
 def page_evidence_cmd(
     job_dir: Path,
     page_number: int = typer.Argument(..., help="页码"),
@@ -183,7 +259,7 @@ def page_evidence_cmd(
     console.print(text[:1000])
 
 
-@app.command("页面图像证据")
+@app.command("页面图像证据", cls=ChineseTyperCommand)
 def page_image_evidence_cmd(
     job_dir: Path,
     page_number: int = typer.Argument(..., help="页码"),
@@ -199,7 +275,7 @@ def page_image_evidence_cmd(
     console.print(f"图像路径: {result.get('图像路径')}")
 
 
-@app.command("书库扫描")
+@app.command("书库扫描", cls=ChineseTyperCommand)
 def scan_library_cmd(
     root: Path,
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", help="输出目录"),
@@ -215,7 +291,7 @@ def scan_library_cmd(
     console.print(f"发现 PDF: {result.get('summary', {}).get('发现PDF数量', 0)}")
 
 
-@app.command("书库提取")
+@app.command("书库提取", cls=ChineseTyperCommand)
 def extract_library_cmd(
     root: Path,
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", help="输出目录"),

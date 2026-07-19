@@ -1,9 +1,9 @@
 {
   "mcpServers": {
-    "中文PDF书籍救援": {
+    "pdf-rescue": {
       "command": "uv",
-      "args": ["run", "--locked", "python", "-B", "scripts/start_mcp.py"],
-      "cwd": ".",
+      "args": ["run", "--locked", "--extra", "ocr", "python", "-B", "scripts/start_mcp.py"],
+      "cwd": "{{PROJECT_ROOT}}",
       "env": {
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",

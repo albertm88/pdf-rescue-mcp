@@ -1,6 +1,6 @@
 [project]
 name = "pdf-rescue-mcp"
-version = "0.1.0"
+version = "1.0.0"
 description = "面向中文书籍PDF的本地MCP服务与命令行工具。"
 readme = "README.md"
 requires-python = ">=3.11"

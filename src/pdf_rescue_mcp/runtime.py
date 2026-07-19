@@ -14,6 +14,77 @@ from .ocr_engines import _quiet_native_output, prepare_paddle_gpu_dlls
 from .paths import ensure_runtime_layout
 
 
+def _decode_command_output(value: bytes | str | None) -> str:
+    """Decode external utility output without leaking Windows code-page errors.
+
+    MCP stdio uses UTF-8, while Windows command wrappers can still emit a legacy
+    code page.  Keep their bytes inside the runtime probe instead of allowing a
+    background ``subprocess`` decoder thread to write a traceback to stderr.
+    """
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    encodings = ("utf-8", "mbcs") if os.name == "nt" else ("utf-8",)
+    for encoding in encodings:
+        try:
+            return value.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return value.decode("utf-8", errors="replace")
+
+
+def collect_process_resource_usage(pid: int | None) -> dict[str, object]:
+    """采集工作进程的轻量资源快照。
+
+    这是监控层的数据，不参与OCR业务流程，也不会触碰工作进程的线程或
+    解释器。采样失败时返回明确的不可用状态，避免把缺失的监控数据伪装成
+    0% 占用。
+    """
+    if pid is None:
+        return {
+            "状态": "不可用",
+            "进程ID": None,
+            "CPU占用率": None,
+            "内存占用率": None,
+            "内存MB": None,
+            "说明": "尚未取得工作进程PID。",
+        }
+    try:
+        process = psutil.Process(int(pid))
+        if not process.is_running():
+            return {
+                "状态": "不可用",
+                "进程ID": int(pid),
+                "CPU占用率": None,
+                "内存占用率": None,
+                "内存MB": None,
+                "说明": "工作进程已退出。",
+            }
+        # 50ms是监控采样窗口，不会让MCP等待OCR；按工作进程而不是启动器采样。
+        cpu_percent = round(float(process.cpu_percent(interval=0.05)), 1)
+        memory_info = process.memory_info()
+        memory_percent = round(float(process.memory_percent()), 2)
+        memory_mb = round(memory_info.rss / (1024 * 1024), 1)
+        return {
+            "状态": "可用",
+            "进程ID": int(pid),
+            "CPU占用率": cpu_percent,
+            "内存占用率": memory_percent,
+            "内存MB": memory_mb,
+            "说明": "按独立OCR工作进程采样；GPU占用需由GPU运行时单独提供。",
+        }
+    except (OSError, ValueError, psutil.Error) as exc:
+        return {
+            "状态": "不可用",
+            "进程ID": int(pid),
+            "CPU占用率": None,
+            "内存占用率": None,
+            "内存MB": None,
+            "说明": f"工作进程资源采样失败：{type(exc).__name__}。",
+        }
+
+
 def _command_status(name: str, candidates: list[str], version_args: list[str]) -> ToolStatus:
     found = None
     for candidate in candidates:
@@ -31,11 +102,10 @@ def _command_status(name: str, candidates: list[str], version_args: list[str]) -
         proc = subprocess.run(
             [path, *version_args],
             capture_output=True,
-            text=True,
             timeout=5,
             check=False,
         )
-        output = (proc.stdout or proc.stderr).strip()
+        output = _decode_command_output(proc.stdout or proc.stderr).strip()
         if proc.returncode != 0 and "cannot find" in output.lower():
             return ToolStatus(
                 name=name,
@@ -68,16 +138,16 @@ def _probe_nvidia_gpu() -> dict[str, object]:
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
-            text=True,
             timeout=5,
             check=False,
         )
-        if proc.returncode != 0 or not proc.stdout.strip():
+        output = _decode_command_output(proc.stdout)
+        if proc.returncode != 0 or not output.strip():
             return {
                 "hardware_available": False,
-            "reason": "显卡探测工具存在，但没有返回可用显卡信息。",
+                "reason": "显卡探测工具存在，但没有返回可用显卡信息。",
             }
-        rows = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        rows = [line.strip() for line in output.splitlines() if line.strip()]
         first = [part.strip() for part in rows[0].split(",")]
         memory_gb = None
         if len(first) > 1:

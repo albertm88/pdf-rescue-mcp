@@ -21,9 +21,13 @@ EXPECTED_TOOL_NAMES = [
     "get_processing_history",
     "share_processing_history",
     "resume_job",
+    "cancel_job",
     "audit_job_quality",
+    "get_iteration_plan",
     "scan_pdf_library",
     "batch_extract_library",
+    "get_batch_status",
+    "stop_batch",
 ]
 
 
