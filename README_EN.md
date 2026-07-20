@@ -28,7 +28,7 @@ uv --version
 ### Step 2: Clone & Install
 
 ```bash
-git clone https://github.com/<your-username>/pdf-rescue-mcp.git
+git clone https://github.com/albertm88/pdf-rescue-mcp.git
 cd pdf-rescue-mcp
 
 # CPU mode (all platforms)
