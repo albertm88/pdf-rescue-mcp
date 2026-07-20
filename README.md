@@ -1,5 +1,9 @@
 # 中文PDF书籍救援 MCP
 
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![MCP](https://img.shields.io/badge/MCP-1.13.0+-purple.svg)](https://modelcontextprotocol.io/)
+
 中文 | [English](README_EN.md)
 
 面向中文书籍 PDF 的本地 MCP 服务与命令行工具，支持扫描版 PDF 的 OCR 文本提取、质量巡检、断点续传和批量处理。
