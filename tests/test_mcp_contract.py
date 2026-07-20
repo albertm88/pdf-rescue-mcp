@@ -28,6 +28,10 @@ EXPECTED_TOOL_NAMES = [
     "batch_extract_library",
     "get_batch_status",
     "stop_batch",
+    "plan_ocr_capacity_profile",
+    "start_ocr_capacity_profile",
+    "get_ocr_capacity_profile",
+    "activate_ocr_capacity_profile",
 ]
 
 

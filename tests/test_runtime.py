@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pdf_rescue_mcp.runtime as runtime
 from pdf_rescue_mcp.models import ToolStatus
+from pdf_rescue_mcp.resource_scheduler import ProcessCpuSample
+from pdf_rescue_mcp.zh import zh_data
 
 
 def test_command_output_tolerates_windows_legacy_bytes() -> None:
@@ -114,3 +116,72 @@ def test_runtime_readiness_reports_portability_risks(monkeypatch) -> None:
     assert readiness.uv_available is False
     assert readiness.recommended_runner == "python"
     assert any("macOS" in note for note in readiness.notes)
+
+
+def test_process_resource_usage_shows_machine_share_and_each_thread(monkeypatch) -> None:
+    class FakeProcess:
+        def is_running(self) -> bool:
+            return True
+
+        @staticmethod
+        def memory_info():
+            return SimpleNamespace(rss=512 * 1024 * 1024)
+
+        @staticmethod
+        def memory_percent() -> float:
+            return 3.5
+
+        @staticmethod
+        def num_threads() -> int:
+            return 27
+
+    monkeypatch.setattr(runtime.psutil, "Process", lambda _pid: FakeProcess())
+    monkeypatch.setattr(
+        runtime,
+        "sample_process_cpu_usage",
+        lambda _process: ProcessCpuSample(
+            cpu_percent=51.9,
+            cpu_core_equivalents=8.31,
+            thread_cpu_percent={"100": 100.0, "101": 62.5},
+            sample_window_seconds=0.2,
+        ),
+    )
+
+    usage = runtime.collect_process_resource_usage(1234)
+
+    assert usage["CPU占用率"] == 51.9
+    assert usage["CPU等效核心数"] == 8.31
+    assert usage["线程CPU占用率"] == {"100": 100.0, "101": 62.5}
+    assert usage["进程线程数"] == 27
+    assert usage["运行内存占用MB"] == 512.0
+    assert usage["运行内存占整机比例"] == 3.5
+
+
+def test_process_resource_usage_keeps_thread_count_unknown_without_a_pid() -> None:
+    usage = runtime.collect_process_resource_usage(None)
+
+    assert usage["进程线程数"] is None
+    assert usage["运行内存占用MB"] is None
+    assert usage["运行内存占整机比例"] is None
+
+
+def test_worker_cpu_fields_are_translated_for_mcp_clients() -> None:
+    data = zh_data(
+        {
+            "workers": [
+                {
+                    "pid": 1234,
+                    "cpu_percent": 51.9,
+                    "cpu_core_equivalents": 8.31,
+                    "thread_cpu_percent": {"100": 100.0},
+                    "memory_mb": 512.0,
+                }
+            ]
+        }
+    )
+
+    worker = data["worker资源"][0]
+    assert worker["进程ID"] == 1234
+    assert worker["CPU占整机比例"] == 51.9
+    assert worker["CPU等效核心数"] == 8.31
+    assert worker["线程CPU占用率"] == {"100": 100.0}

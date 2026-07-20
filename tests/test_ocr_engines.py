@@ -27,6 +27,12 @@ def test_cpu_thread_count_stays_within_device_capacity() -> None:
     assert _cpu_thread_count(8) == 4
 
 
+def test_configured_ocr_threads_are_limited_to_the_one_to_four_worker_contract(monkeypatch) -> None:
+    monkeypatch.setenv("PDF_RESCUE_OCR_THREADS", "8")
+
+    assert _cpu_thread_count() == 4
+
+
 def test_gpu_inference_failure_falls_back_to_cpu(monkeypatch, tmp_path: Path) -> None:
     class FailingEngine:
         def predict(self, image_path: str):

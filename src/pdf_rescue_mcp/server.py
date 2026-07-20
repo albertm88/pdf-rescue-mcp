@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import subprocess
 import sys
 import os
@@ -25,6 +26,7 @@ from .book_pipeline import get_page_evidence as read_page_evidence
 from .book_pipeline import get_term_glossary as read_term_glossary
 from .book_pipeline import read_job_status as run_read_job_status
 from .book_pipeline import _format_duration, _processing_metrics
+from .capacity_benchmark import CapacityBenchmarkManager
 from .library_pipeline import scan_pdf_library as run_scan_pdf_library
 from .pdf_inspector import inspect_pdf_text_layer as run_inspect_pdf_text_layer
 from .planner import plan_pdf_job as run_plan_pdf_job
@@ -37,7 +39,9 @@ from .stdio_encoding import configure_utf8_stdio
 from .history import collect_processing_history, share_processing_history
 from .iteration import build_iteration_plan
 from .process_controller import ProcessController, WorkerHandle
+from .resource_scheduler import ResourceScheduler, WorkerPlan, worker_threads_for_pages
 from .supervisor import LocalSupervisor, SupervisedAttempt
+from .throughput_tuning import ThroughputProfileStore
 from .zh import zh_data
 
 
@@ -394,6 +398,26 @@ class _TaskManager:
             error={"reason": reason or phase} if phase != "完成" else None,
         )
 
+    def _recover_orphaned_supervision_locked(self, info: dict[str, Any]) -> bool:
+        """Release a stale durable attempt before an explicit resume.
+
+        This path is reached only after local liveness checks have found no
+        active worker.  A valid fencing lease still wins inside the supervisor,
+        so a concurrent adapter cannot be stolen merely because this MCP host
+        restarted.
+        """
+        supervisor = self._get_supervisor()
+        job_id = info.get("持久任务ID")
+        if supervisor is None or not isinstance(job_id, str) or not job_id:
+            return False
+        try:
+            return supervisor.recover_orphan(
+                job_id,
+                reason="本地任务已终止，按显式恢复请求重新入队",
+            )
+        except Exception:
+            return False
+
     def _renew_supervision_locked(self, info: dict[str, Any]) -> bool:
         context = info.get("supervision_context")
         supervisor = self._get_supervisor()
@@ -451,6 +475,15 @@ class _TaskManager:
                 "PDF_RESCUE_CANCEL_PATH": str(cancel_path),
             }
         )
+        if info.get("ocr_threads") is not None:
+            child_env["PDF_RESCUE_OCR_THREADS"] = str(info["ocr_threads"])
+        # Capacity profiles exclude a fixed number of cold-start pages from the
+        # rolling OCR throughput metric.  It is an environment knob because the
+        # child process owns the Paddle adapter and must never be hot-reconfigured.
+        if info.get("ocr_profile_warmup_pages") is not None:
+            child_env["PDF_RESCUE_OCR_PROFILE_WARMUP_PAGES"] = str(
+                info["ocr_profile_warmup_pages"]
+            )
         context = info.get("supervision_context")
         supervisor = self._get_supervisor()
         if isinstance(context, SupervisedAttempt) and supervisor is not None:
@@ -525,6 +558,8 @@ class _TaskManager:
         max_pages: int | None,
         resume: bool,
         password: str | None,
+        ocr_threads: int | None = None,
+        ocr_profile_warmup_pages: int | None = None,
     ) -> tuple[str, bool]:
         source = Path(path).expanduser().resolve()
         base_dir = self._output_root(source, output_dir)
@@ -536,11 +571,17 @@ class _TaskManager:
             info = self._tasks.get(job_key)
             if info and self._is_live(info):
                 return job_key, True
-            if info and self._pid_alive(self._heartbeat(info).get("进程ID")):
+            current_state = self._status_state(job_dir)
+            if (
+                info
+                and not self._is_terminal_state(current_state)
+                and self._pid_alive(self._heartbeat(info).get("进程ID"))
+            ):
                 # The old worker has no fresh heartbeat. Let the monitor stop it before retrying.
                 self._request_cancel_locked(info)
                 return job_key, True
 
+            recovery_info = info
             stored = self._read_json(metadata_path)
             if stored:
                 stored_info = dict(stored)
@@ -553,10 +594,18 @@ class _TaskManager:
                         "process": None,
                     }
                 )
-                if self._is_live(stored_info) or self._pid_alive(self._heartbeat(stored_info).get("进程ID")):
+                stored_state = self._status_state(job_dir)
+                if self._is_live(stored_info) or (
+                    not self._is_terminal_state(stored_state)
+                    and self._pid_alive(self._heartbeat(stored_info).get("进程ID"))
+                ):
                     self._tasks[job_key] = stored_info
                     self._ensure_watcher_locked()
                     return job_key, True
+                recovery_info = stored_info
+
+            if isinstance(recovery_info, dict):
+                self._recover_orphaned_supervision_locked(recovery_info)
 
             supervision_context = self._begin_supervision_locked(
                 source=source,
@@ -578,6 +627,8 @@ class _TaskManager:
                 "max_pages": max_pages,
                 "resume": resume,
                 "password": password,
+                "ocr_threads": ocr_threads,
+                "ocr_profile_warmup_pages": ocr_profile_warmup_pages,
                 "started_at": time.time(),
                 "restart_count": 0,
                 "phase": "启动中",
@@ -897,8 +948,12 @@ class _TaskManager:
                     }
                 )
             heartbeat = self._heartbeat(info)
-            state = self._status_state(Path(job_key))
-            live = bool(heartbeat["活跃"] and not self._is_terminal_state(state))
+            # ``存活`` is an admission/ownership signal, not merely a
+            # heartbeat signal.  A newly spawned worker can take tens of
+            # seconds to initialise Paddle and write its first heartbeat;
+            # reporting it as dead during that startup grace makes the batch
+            # scheduler launch duplicate books every polling interval.
+            live = self._is_live(info)
             progress_age = self._progress_age_seconds(heartbeat)
             return {
                 "存活": live,
@@ -938,6 +993,14 @@ class _TaskManager:
 
 
 _task_manager = _TaskManager(enable_durable_supervision=True)
+_capacity_benchmark_manager = CapacityBenchmarkManager(
+    task_starter=_task_manager.start_extraction,
+    task_info_reader=_task_manager.get_task_info,
+    task_canceller=lambda job_dir: _task_manager.request_cancel(
+        job_dir,
+        reason="容量基准已取消或检测到生产 OCR",
+    ),
+)
 
 
 def _build_task_metrics(status: dict[str, Any], task_info: dict[str, Any]) -> dict[str, Any]:
@@ -954,10 +1017,127 @@ def _build_task_metrics(status: dict[str, Any], task_info: dict[str, Any]) -> di
     return metrics
 
 
-class _BatchManager:
-    """批量任务管理器：在后台线程中逐本启动提取，MCP 服务器保持响应。
+def _finite_number(value: object) -> float | None:
+    """Return a finite metric value without turning a missing sample into zero."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
-    支持状态持久化：批量配置和进度写入文件，MCP 服务器重启后自动恢复。
+
+def _nonnegative_integer(value: object) -> int | None:
+    number = _finite_number(value)
+    if number is None or number < 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _worker_resource_summary(
+    worker_resources: list[dict[str, object]],
+    *,
+    logical_cpu_count: int,
+    total_memory_mb: float | None,
+) -> dict[str, object]:
+    """Aggregate existing worker snapshots without taking a second sample.
+
+    A missing PID or metric remains visible as an incomplete observation.  This
+    is important during the worker startup handshake: reporting an unknown
+    worker as ``0`` would make the scheduler and an MCP client reach opposite
+    conclusions about available capacity.
+    """
+    worker_count = len(worker_resources)
+    pid_count = 0
+    usable_count = 0
+    complete_count = 0
+    thread_sample_count = 0
+    usages: list[dict[str, object]] = []
+    configured_thread_budgets: list[int] = []
+
+    for worker in worker_resources:
+        usage = worker.get("资源占用率")
+        snapshot = usage if isinstance(usage, dict) else {}
+        usages.append(snapshot)
+        if _nonnegative_integer(worker.get("进程ID")) is not None:
+            pid_count += 1
+        if snapshot.get("状态") == "可用":
+            usable_count += 1
+        if isinstance(snapshot.get("线程CPU占用率"), dict):
+            thread_sample_count += 1
+        if (
+            snapshot.get("状态") == "可用"
+            and _finite_number(snapshot.get("CPU等效核心数")) is not None
+            and _finite_number(snapshot.get("内存MB")) is not None
+            and _nonnegative_integer(snapshot.get("进程线程数")) is not None
+        ):
+            complete_count += 1
+        budget = _nonnegative_integer(worker.get("线程预算"))
+        if budget is not None:
+            configured_thread_budgets.append(budget)
+
+    def _total_number(key: str, digits: int = 1) -> float | None:
+        values = [value for usage in usages if (value := _finite_number(usage.get(key))) is not None]
+        return round(sum(values), digits) if values else None
+
+    def _total_integer(key: str) -> int | None:
+        values = [value for usage in usages if (value := _nonnegative_integer(usage.get(key))) is not None]
+        return sum(values) if values else None
+
+    cpu_core_values: list[float] = []
+    for usage in usages:
+        core_equivalents = _finite_number(usage.get("CPU等效核心数"))
+        if core_equivalents is None:
+            cpu_percent = _finite_number(usage.get("CPU占用率"))
+            if cpu_percent is not None:
+                core_equivalents = cpu_percent / 100.0 * max(1, logical_cpu_count)
+        if core_equivalents is not None:
+            cpu_core_values.append(max(0.0, core_equivalents))
+
+    total_cpu_cores = round(sum(cpu_core_values), 2) if cpu_core_values else None
+    total_cpu_percent = (
+        round(min(100.0, total_cpu_cores / max(1, logical_cpu_count) * 100.0), 1)
+        if total_cpu_cores is not None
+        else None
+    )
+    total_rss_mb = _total_number("内存MB")
+    memory_capacity_mb = _finite_number(total_memory_mb)
+    total_memory_percent = (
+        round(total_rss_mb / memory_capacity_mb * 100.0, 2)
+        if total_rss_mb is not None and memory_capacity_mb is not None and memory_capacity_mb > 0
+        else _total_number("内存占用率", digits=2)
+    )
+
+    return {
+        "统计worker数": worker_count,
+        "已取得PID的worker数": pid_count,
+        "可采样worker数": usable_count,
+        "不可采样worker数": worker_count - usable_count,
+        "线程采样worker数": thread_sample_count,
+        "采样完整": complete_count == worker_count,
+        "总OCR线程预算": sum(configured_thread_budgets) if configured_thread_budgets else None,
+        "总进程线程数": _total_integer("进程线程数"),
+        "总活跃CPU线程数": _total_integer("活跃CPU线程数"),
+        "总饱和CPU线程数": _total_integer("饱和CPU线程数"),
+        "总RSS内存MB": total_rss_mb,
+        "总内存占整机比例": total_memory_percent,
+        "总运行内存占用MB": total_rss_mb,
+        "总运行内存占整机比例": total_memory_percent,
+        "总CPU等效核心数": total_cpu_cores,
+        "总CPU占整机比例": total_cpu_percent,
+        "资源汇总说明": (
+            "总CPU占整机比例按各 worker CPU 等效核心数之和除以逻辑 CPU 数计算，"
+            "固定为 0–100%；总CPU等效核心数可大于 1，不能当作百分比。"
+            "总RSS内存MB为已采样进程 RSS 之和；采样不完整时不会把未知值计为 0。"
+        ),
+    }
+
+
+class _BatchManager:
+    """批量任务管理器：后台调度独立书籍 worker，MCP 服务器保持响应。
+
+    支持状态持久化、书本级完成计数，以及按 CPU/内存实时占用动态调整并发。
     """
 
     BATCH_STATE_FILE = "批量状态.json"
@@ -971,9 +1151,14 @@ class _BatchManager:
         self._current_job_dir: str | None = None
         self._completed: list[str] = []
         self._failed: list[dict[str, str]] = []
+        self._active_jobs: dict[str, dict[str, Any]] = {}
         self._started_at: float | None = None
         self._mode = "book-fast"
         self._max_pages_per_book: int | None = None
+        self._requested_workers: int | None = None
+        self._resource_scheduler = ResourceScheduler()
+        self._throughput_profiles = ThroughputProfileStore()
+        self._last_worker_plan: WorkerPlan | None = None
         self._resume = True
         self._output_dir: str | None = None
         self._root: str | None = None
@@ -1010,6 +1195,8 @@ class _BatchManager:
                 "当前任务目录": self._current_job_dir,
                 "已完成": self._completed,
                 "失败": self._failed,
+                "活动任务": list(self._active_jobs.values()),
+                "最大并发worker": self._requested_workers,
                 "书籍列表": self._books,
             }
             _TaskManager._atomic_json(self._state_file_path(), state)
@@ -1035,6 +1222,13 @@ class _BatchManager:
             self._started_at = state.get("开始时间")
             self._completed = state.get("已完成", [])
             self._failed = state.get("失败", [])
+            self._active_jobs = {
+                str(item.get("任务目录")): dict(item)
+                for item in state.get("活动任务", [])
+                if isinstance(item, dict) and item.get("任务目录")
+            }
+            self._requested_workers = state.get("最大并发worker")
+            self._resource_scheduler = ResourceScheduler(max_workers=self._requested_workers)
             self._books = state.get("书籍列表", [])
             self._current_index = state.get("当前索引", -1)
             self._current_job_dir = state.get("当前任务目录")
@@ -1074,6 +1268,7 @@ class _BatchManager:
         max_books: int | None,
         max_pages_per_book: int | None,
         resume: bool,
+        max_workers: int | None = None,
     ) -> dict[str, Any]:
         """启动批量提取，立即返回，后台逐本处理。"""
         with self._lock:
@@ -1088,12 +1283,21 @@ class _BatchManager:
             self._started_at = time.time()
             self._completed = []
             self._failed = []
+            self._active_jobs = {}
             self._current_index = -1
             self._current_job_dir = None
+            self._requested_workers = max_workers
+            self._resource_scheduler = ResourceScheduler(max_workers=max_workers)
+            active_tuning = self._throughput_profiles.active_recommendation(mode=mode)
+            self._last_worker_plan = self._resource_scheduler.plan(
+                preferred_workers=(active_tuning or {}).get("workers"),
+                preferred_threads_per_worker=(active_tuning or {}).get("threads_per_worker"),
+                tuning_profile_id=(active_tuning or {}).get("配置ID"),
+            )
 
             # 扫描书库（快速模式：不逐本检查文本层，直接全部需要OCR）
             from .library_pipeline import scan_pdf_library
-            scan = scan_pdf_library(root, output_dir=output_dir, inspect_pages=0)
+            scan = scan_pdf_library(root, output_dir=output_dir, inspect_pages=3)
             books = scan.get("书籍", [])
             need_ocr = [
                 b for b in books
@@ -1117,114 +1321,309 @@ class _BatchManager:
                 "输出目录": output_dir,
                 "每本最大页数": max_pages_per_book,
                 "断点续传": resume,
+                "最大并发worker": self._last_worker_plan.target_workers if self._last_worker_plan else 1,
+                "并发策略": "按CPU线程、系统可用内存和worker实时占用动态调整",
             }
 
+    def _expected_book_pages(self, book: dict[str, Any], status: dict[str, Any] | None) -> int:
+        source_total = 0
+        for value in (book.get("总页数"), (status or {}).get("PDF总页数")):
+            try:
+                source_total = max(source_total, int(value or 0))
+            except (TypeError, ValueError):
+                continue
+        if self._max_pages_per_book:
+            return min(source_total, self._max_pages_per_book) if source_total else self._max_pages_per_book
+        return source_total or int((status or {}).get("目标页数") or 0)
+
+    def _is_book_complete(self, book: dict[str, Any], status: dict[str, Any] | None) -> bool:
+        if not status or status.get("状态") != "完成":
+            return False
+        expected = self._expected_book_pages(book, status)
+        try:
+            processed = int(status.get("已处理页数") or 0)
+            target = int(status.get("目标页数") or 0)
+        except (TypeError, ValueError):
+            return False
+        if expected <= 0:
+            return processed > 0 and processed >= target > 0
+        return processed >= expected and target >= expected
+
+    def _record_book_completion(self, book_name: str) -> None:
+        if book_name not in self._completed:
+            self._completed.append(book_name)
+        self._failed = [item for item in self._failed if item.get("书名") != book_name]
+
+    def _record_book_failure(self, book_name: str, reason: str) -> None:
+        if not any(item.get("书名") == book_name for item in self._failed):
+            self._failed.append({"书名": book_name, "原因": reason})
+
+    def _next_book_index(self) -> int:
+        """Return the first book index that is not already owned by a worker."""
+        active_indices: list[int] = []
+        for record in self._active_jobs.values():
+            try:
+                active_indices.append(int(record.get("索引")))
+            except (TypeError, ValueError):
+                continue
+        if active_indices:
+            return max(active_indices) + 1
+        return max(0, self._current_index) if self._current_index >= 0 else 0
+
+    def _resume_cancelled_active_jobs(self) -> bool:
+        """Restart interrupted books before admitting a new book worker."""
+        if not self._running or not self._resume:
+            return False
+        from .library_pipeline import _read_status
+
+        resumed = False
+        for job_key, record in list(self._active_jobs.items()):
+            status = _read_status(Path(job_key))
+            if (status or {}).get("状态") != "已取消":
+                continue
+            info = _task_manager.get_task_info(job_key) or {}
+            if info.get("存活"):
+                continue
+            try:
+                resumed_job_dir, _already_running = _task_manager.start_extraction(
+                    path=str(record.get("来源PDF") or ""),
+                    output_dir=str(Path(job_key).parent),
+                    mode=self._mode,
+                    max_pages=self._max_pages_per_book,
+                    resume=True,
+                    password=None,
+                    ocr_threads=record.get("线程预算"),
+                )
+            except Exception:
+                continue
+            if resumed_job_dir != job_key:
+                resumed_record = dict(record)
+                resumed_record["任务目录"] = resumed_job_dir
+                with self._lock:
+                    self._active_jobs.pop(job_key, None)
+                    self._active_jobs[resumed_job_dir] = resumed_record
+                    self._current_job_dir = resumed_job_dir
+            resumed = True
+        return resumed
+
     def _batch_loop(self) -> None:
-        """后台线程：逐本启动提取并等待完成。"""
+        """后台调度书籍任务，并按资源余量动态分配独立 OCR workers。"""
         from .library_pipeline import _job_dir_for_pdf, _read_status
+
         root_path = Path(self._root) if self._root else None
         output_path = Path(self._output_dir) if self._output_dir else None
+        # On a restored batch, ``_current_index`` is the most recently
+        # registered book, while active records may include it and earlier
+        # books.  Rescheduling that index consumes a thread slot for an
+        # already-live worker and can incorrectly downgrade the genuinely new
+        # worker to one thread.  With active records, continue strictly after
+        # their largest index; without them retain the existing resume point.
+        next_index = self._next_book_index()
 
-        # 恢复时跳过已完成的书籍
-        start_index = max(0, self._current_index) if self._current_index >= 0 else 0
-
-        for i in range(start_index, len(self._books)):
-            with self._lock:
-                self._current_index = i
-            book = self._books[i]
-            pdf_path = Path(book["PDF路径"])
-            book_name = book["文件名"].replace(".pdf", "")
-
-            # 跳过已完成的
-            if book_name in self._completed:
+        while True:
+            # Restored jobs are resumed first.  The next pass samples their
+            # new PIDs before deciding whether a further book can be admitted.
+            if self._resume_cancelled_active_jobs():
+                self._save_state()
+                time.sleep(5)
                 continue
 
-            try:
-                job_dir = _job_dir_for_pdf(pdf_path, root_path, output_path) if root_path and output_path else None
+            # 资源采样以真实 worker PID 为依据；启动器 PID 不参与容量判断。
+            worker_pids: list[int] = []
+            worker_thread_budgets: dict[int, int] = {}
+            throughput_samples: list[float] = []
+            with self._lock:
+                active_snapshot = list(self._active_jobs.values())
+            for record in active_snapshot:
+                info = _task_manager.get_task_info(str(record.get("任务目录"))) or {}
+                pid = info.get("工作进程ID")
+                if isinstance(pid, int) and pid > 0 and info.get("存活"):
+                    worker_pids.append(pid)
+                    try:
+                        worker_thread_budgets[pid] = max(1, int(record.get("线程预算") or 1))
+                    except (TypeError, ValueError):
+                        pass
+                status = _read_status(Path(str(record.get("任务目录"))))
+                try:
+                    rate = float((status or {}).get("短窗OCR页每分钟") or 0.0)
+                except (TypeError, ValueError):
+                    rate = 0.0
+                if rate > 0:
+                    throughput_samples.append(rate)
+            aggregate_throughput = round(sum(throughput_samples), 3) if throughput_samples else None
+            active_tuning = self._throughput_profiles.active_recommendation(mode=self._mode)
+            plan = self._resource_scheduler.plan(
+                worker_pids,
+                worker_thread_budgets=worker_thread_budgets,
+                preferred_workers=(active_tuning or {}).get("workers"),
+                preferred_threads_per_worker=(active_tuning or {}).get("threads_per_worker"),
+                throughput_pages_per_minute=aggregate_throughput,
+                tuning_profile_id=(active_tuning or {}).get("配置ID"),
+            )
+            with self._lock:
+                self._last_worker_plan = plan
 
-                # 检查是否已完成
-                status = _read_status(job_dir) if job_dir else None
-                if status and status.get("状态") == "完成":
-                    processed = status.get("已处理页数", 0)
-                    target = status.get("目标页数", 0)
-                    if processed >= target and target > 0:
+            # 只在批量任务未收到停止请求时补充新的书籍 worker。
+            available_new_worker_slots = plan.available_thread_slots
+            while self._running and len(active_snapshot) < plan.target_workers and next_index < len(self._books):
+                if available_new_worker_slots < 1:
+                    break
+                index = next_index
+                next_index += 1
+                book = self._books[index]
+                pdf_path = Path(book["PDF路径"])
+                book_name = book["文件名"].replace(".pdf", "")
+                if book_name in self._completed or any(item.get("书名") == book_name for item in self._failed):
+                    continue
+                try:
+                    job_dir = _job_dir_for_pdf(pdf_path, root_path, output_path) if root_path and output_path else None
+                    status = _read_status(job_dir) if job_dir else None
+                    if self._is_book_complete(book, status):
                         with self._lock:
-                            self._completed.append(book_name)
+                            self._record_book_completion(book_name)
                         self._save_state()
                         continue
 
-                # 启动子进程
-                actual_output_dir = str(job_dir.parent) if job_dir else None
-                returned_job_dir, already_running = _task_manager.start_extraction(
-                    path=str(pdf_path),
-                    output_dir=actual_output_dir,
-                    mode=self._mode,
-                    max_pages=self._max_pages_per_book,
-                    resume=self._resume,
-                    password=None,
-                )
+                    expected_pages = self._expected_book_pages(book, status)
+                    worker_threads = worker_threads_for_pages(
+                        expected_pages,
+                        capacity_threads=plan.threads_per_worker,
+                        available_thread_slots=available_new_worker_slots,
+                    )
+                    actual_output_dir = str(job_dir.parent) if job_dir else None
+                    returned_job_dir, _already_running = _task_manager.start_extraction(
+                        path=str(pdf_path),
+                        output_dir=actual_output_dir,
+                        mode=self._mode,
+                        max_pages=self._max_pages_per_book,
+                        resume=self._resume,
+                        password=None,
+                        ocr_threads=worker_threads,
+                    )
+                    record = {
+                        "索引": index,
+                        "书名": book_name,
+                        "任务目录": returned_job_dir,
+                        "来源PDF": str(pdf_path),
+                        "线程预算": worker_threads,
+                        "工作量页数": expected_pages,
+                        "线程预算依据": (
+                            f"{expected_pages or '未知'} 页工作量按 1–4 线程档位选择，"
+                            f"再受当前可用线程槽限制为 {worker_threads}。"
+                        ),
+                    }
+                    available_new_worker_slots = max(0, available_new_worker_slots - worker_threads)
+                    with self._lock:
+                        self._active_jobs[returned_job_dir] = record
+                        self._current_index = index
+                        self._current_job_dir = returned_job_dir
+                        active_snapshot = list(self._active_jobs.values())
+                    self._save_state()
+                except Exception as exc:
+                    with self._lock:
+                        self._record_book_failure(book_name, f"{type(exc).__name__}: {exc}")
+                    self._save_state()
 
+            # 回收已结束的任务；页数不足的“完成”状态不会被计入完成书本。
+            for job_key, record in list(self._active_jobs.items()):
+                info = _task_manager.get_task_info(job_key) or {}
+                status = _read_status(Path(job_key))
+                if info.get("存活"):
+                    continue
+                book_name = str(record.get("书名") or "未知书籍")
+                book_index = int(record.get("索引") or -1)
+                book = self._books[book_index] if 0 <= book_index < len(self._books) else {}
+                if self._running and self._resume and (status or {}).get("状态") == "已取消":
+                    # A batch launch is explicit resume intent.  A prior MCP
+                    # process may have been stopped after asking the worker to
+                    # cancel, leaving a terminal status plus an orphaned
+                    # durable attempt.  Retry the same book in place instead
+                    # of misclassifying it as failed and moving to later books.
+                    try:
+                        resumed_job_dir, _already_running = _task_manager.start_extraction(
+                            path=str(record.get("来源PDF") or book.get("PDF路径")),
+                            output_dir=str(Path(job_key).parent),
+                            mode=self._mode,
+                            max_pages=self._max_pages_per_book,
+                            resume=True,
+                            password=None,
+                            ocr_threads=record.get("线程预算"),
+                        )
+                        if resumed_job_dir != job_key:
+                            resumed_record = dict(record)
+                            resumed_record["任务目录"] = resumed_job_dir
+                            with self._lock:
+                                self._active_jobs.pop(job_key, None)
+                                self._active_jobs[resumed_job_dir] = resumed_record
+                                self._current_job_dir = resumed_job_dir
+                        self._save_state()
+                        continue
+                    except Exception:
+                        # Fall through to the normal failed-book record, which
+                        # retains a visible reason for a genuine resume error.
+                        pass
                 with self._lock:
-                    self._current_job_dir = returned_job_dir
+                    self._active_jobs.pop(job_key, None)
+                    if self._is_book_complete(book, status):
+                        self._record_book_completion(book_name)
+                    else:
+                        state = str((status or {}).get("状态") or "无状态文件")
+                        processed = (status or {}).get("已处理页数", 0)
+                        expected = self._expected_book_pages(book, status)
+                        self._record_book_failure(book_name, f"{state}（{processed}/{expected or '未知'}页）")
                 self._save_state()
 
-                # 等待这本书完成
-                while True:
-                    time.sleep(30)
-                    if not self._running:
-                        self._save_state()
-                        return
-                    info = _task_manager.get_task_info(returned_job_dir)
-                    if not info or not info.get("存活"):
-                        s = _read_status(Path(returned_job_dir))
-                        if s and s.get("状态") == "完成":
-                            with self._lock:
-                                self._completed.append(book_name)
-                        else:
-                            with self._lock:
-                                self._failed.append({"书名": book_name, "原因": str(s.get("状态", "未知")) if s else "无状态文件"})
-                        self._save_state()
-                        break
-            except Exception as e:
-                with self._lock:
-                    self._failed.append({"书名": book_name, "原因": str(e)})
-                self._save_state()
+            with self._lock:
+                active_count = len(self._active_jobs)
+                all_scheduled = next_index >= len(self._books)
+                should_stop = not self._running
+                self._current_job_dir = next(iter(self._active_jobs), None)
+            if active_count == 0 and (all_scheduled or should_stop):
+                break
+            time.sleep(5)
 
         with self._lock:
             self._running = False
+            self._active_jobs = {}
             self._current_job_dir = None
         self._save_state()
 
     def status(self) -> dict[str, Any]:
         """返回批量任务状态。"""
+        from .library_pipeline import _read_status
+
         with self._lock:
             current_book = None
             current_progress = None
             current_metrics: dict[str, Any] = {}
             current_job_dir = None
-            if 0 <= self._current_index < len(self._books):
+            active_records = list(self._active_jobs.values())
+            if active_records:
+                current_book = str(active_records[0].get("书名"))
+                current_job_dir = str(active_records[0].get("任务目录"))
+            elif 0 <= self._current_index < len(self._books):
                 current_book = Path(self._books[self._current_index]["文件名"]).stem
                 current_job_dir = self._current_job_dir
-                if self._current_job_dir:
-                    status_path = Path(self._current_job_dir) / "状态.json"
-                    if status_path.exists():
-                        try:
-                            s = json.loads(status_path.read_text(encoding="utf-8"))
-                            task_info = _task_manager.get_task_info(self._current_job_dir) or {}
-                            current_metrics = _build_task_metrics(s, task_info)
-                            processed = current_metrics.get("已处理页数", 0)
-                            total = current_metrics.get("总处理页数", 0)
-                            current_progress = {
-                                "已处理": processed,
-                                "总数": total,
-                                "百分比": current_metrics.get("处理进度文本", "0.0%"),
-                                "状态": s.get("状态", "未知"),
-                                "平均秒每页": current_metrics.get("处理速度"),
-                                "本书预计剩余秒": current_metrics.get("剩余时间秒"),
-                                "资源占用率": current_metrics.get("资源占用率"),
-                            }
-                        except Exception:
-                            pass
+            if current_job_dir:
+                status_path = Path(current_job_dir) / "状态.json"
+                if status_path.exists():
+                    try:
+                        s = json.loads(status_path.read_text(encoding="utf-8"))
+                        task_info = _task_manager.get_task_info(current_job_dir) or {}
+                        current_metrics = _build_task_metrics(s, task_info)
+                        processed = current_metrics.get("已处理页数", 0)
+                        total = current_metrics.get("总处理页数", 0)
+                        current_progress = {
+                            "已处理": processed,
+                            "总数": total,
+                            "百分比": current_metrics.get("处理进度文本", "0.0%"),
+                            "状态": s.get("状态", "未知"),
+                            "平均秒每页": current_metrics.get("处理速度"),
+                            "本书预计剩余秒": current_metrics.get("剩余时间秒"),
+                            "资源占用率": current_metrics.get("资源占用率"),
+                        }
+                    except Exception:
+                        pass
 
             elapsed = None
             elapsed_str = None
@@ -1234,8 +1633,12 @@ class _BatchManager:
                 elapsed = int(time.time() - self._started_at)
                 elapsed_str = _format_duration(elapsed)
 
-            done = len(self._completed) + len(self._failed)
             total_books = len(self._books)
+            completed_books = len(self._completed)
+            failed_books = len(self._failed)
+            active_book_count = len(active_records)
+            done = completed_books + failed_books
+            pending_books = max(0, total_books - done - active_book_count)
             if self._running and done > 0 and elapsed and elapsed > 10:
                 # 估算剩余时间
                 avg_per_book = elapsed / done
@@ -1243,14 +1646,95 @@ class _BatchManager:
                 eta_seconds = int(avg_per_book * remaining_books)
                 eta_str = f"约{_format_duration(eta_seconds)}"
 
+            worker_pids: list[int] = []
+            worker_thread_budgets: dict[int, int] = {}
+            worker_resources: list[dict[str, object]] = []
+            throughput_samples: list[float] = []
+            for worker_index, record in enumerate(active_records, start=1):
+                info = _task_manager.get_task_info(str(record.get("任务目录"))) or {}
+                candidate_pid = info.get("工作进程ID")
+                pid = candidate_pid if isinstance(candidate_pid, int) and candidate_pid > 0 else None
+                if pid is not None:
+                    worker_pids.append(pid)
+                    try:
+                        worker_thread_budgets[pid] = max(1, int(record.get("线程预算") or 1))
+                    except (TypeError, ValueError):
+                        pass
+                status = _read_status(Path(str(record.get("任务目录"))))
+                try:
+                    rate = float((status or {}).get("短窗OCR页每分钟") or 0.0)
+                except (TypeError, ValueError):
+                    rate = 0.0
+                if rate > 0:
+                    throughput_samples.append(rate)
+                usage = collect_process_resource_usage(pid)
+                worker_resources.append(
+                    {
+                        "worker序号": worker_index,
+                        "书名": record.get("书名"),
+                        "进程ID": pid,
+                        "线程预算": record.get("线程预算"),
+                        "工作量页数": record.get("工作量页数"),
+                        "线程预算依据": record.get("线程预算依据"),
+                        # Direct fields keep clients from having to infer the
+                        # distinction between configured OCR concurrency,
+                        # observed CPU-active threads, and all OS threads.
+                        "进程线程数": usage.get("进程线程数"),
+                        "活跃CPU线程数": usage.get("活跃CPU线程数"),
+                        "饱和CPU线程数": usage.get("饱和CPU线程数"),
+                        "线程CPU占用率": usage.get("线程CPU占用率"),
+                        "CPU占整机比例": usage.get("CPU占用率"),
+                        "CPU等效核心数": usage.get("CPU等效核心数"),
+                        "内存MB": usage.get("内存MB"),
+                        "内存占整机比例": usage.get("内存占用率"),
+                        "运行内存占用MB": usage.get("运行内存占用MB"),
+                        "运行内存占整机比例": usage.get("运行内存占整机比例"),
+                        "资源占用率": usage,
+                    }
+                )
+            active_tuning = self._throughput_profiles.active_recommendation(mode=self._mode)
+            aggregate_throughput = round(sum(throughput_samples), 3) if throughput_samples else None
+            worker_plan = self._resource_scheduler.plan(
+                worker_pids,
+                worker_thread_budgets=worker_thread_budgets,
+                preferred_workers=(active_tuning or {}).get("workers"),
+                preferred_threads_per_worker=(active_tuning or {}).get("threads_per_worker"),
+                throughput_pages_per_minute=aggregate_throughput,
+                tuning_profile_id=(active_tuning or {}).get("配置ID"),
+            )
+            self._last_worker_plan = worker_plan
+            worker_resource_summary = _worker_resource_summary(
+                worker_resources,
+                logical_cpu_count=worker_plan.cpu_count,
+                total_memory_mb=worker_plan.total_memory_gb * 1024.0,
+            )
             resource_usage = current_metrics.get("资源占用率") or collect_process_resource_usage(None)
 
             return {
                 "运行中": self._running,
                 "总书数": total_books,
-                "已完成": len(self._completed),
-                "失败": len(self._failed),
-                "待处理": total_books - done,
+                "书本总数": total_books,
+                "已完成": completed_books,
+                "书本完成数": completed_books,
+                "失败": failed_books,
+                "书本失败数": failed_books,
+                "待处理": pending_books,
+                "书本待处理数": pending_books,
+                "进行中书本数": active_book_count,
+                # ``worker数`` is the number of active batch records.  The
+                # adjacent PID/sample counts expose startup and lost-heartbeat
+                # gaps instead of silently treating them as idle processes.
+                "worker数": active_book_count,
+                "已取得PID的worker数": worker_resource_summary["已取得PID的worker数"],
+                "可采样worker数": worker_resource_summary["可采样worker数"],
+                "不可采样worker数": worker_resource_summary["不可采样worker数"],
+                "worker总占用内存MB": worker_resource_summary["总RSS内存MB"],
+                "worker总内存占整机比例": worker_resource_summary["总内存占整机比例"],
+                "worker总运行内存占用MB": worker_resource_summary["总运行内存占用MB"],
+                "worker总运行内存占整机比例": worker_resource_summary["总运行内存占整机比例"],
+                "worker总进程线程数": worker_resource_summary["总进程线程数"],
+                "worker总CPU等效核心数": worker_resource_summary["总CPU等效核心数"],
+                "worker总CPU占整机比例": worker_resource_summary["总CPU占整机比例"],
                 "整体进度": f"{done}/{total_books} ({done / total_books * 100:.1f}%)" if total_books > 0 else "0/0",
                 "当前书籍": current_book,
                 "当前书籍任务目录": current_job_dir,
@@ -1269,7 +1753,27 @@ class _BatchManager:
                 "剩余时间秒": eta_seconds,
                 "资源占用率": resource_usage,
                 "当前书籍指标": current_metrics or None,
+                "活动书籍": [
+                    {
+                        "书名": record.get("书名"),
+                        "任务目录": record.get("任务目录"),
+                        "来源PDF": record.get("来源PDF"),
+                        "线程预算": record.get("线程预算"),
+                        "工作量页数": record.get("工作量页数"),
+                        "线程预算依据": record.get("线程预算依据"),
+                    }
+                    for record in active_records
+                ],
+                "worker资源": worker_resources,
+                "worker资源汇总": worker_resource_summary,
+                "worker调度": worker_plan.to_dict(),
+                "OCR吞吐页每分钟": aggregate_throughput,
+                "吞吐调优策略": active_tuning or {
+                    "状态": "未激活",
+                    "说明": "可先运行 OCR 容量基准测试，验证2/4/6/8线程和多worker组合后再显式激活。",
+                },
                 "每本最大页数": self._max_pages_per_book,
+                "最大并发worker": self._requested_workers,
                 "断点续传": self._resume,
                 "已运行时间": elapsed_str,
                 "预计剩余时间": eta_str,
@@ -1993,7 +2497,7 @@ def scan_pdf_library(
 @mcp.tool(
     name="batch_extract_library",
     title="批量提取书库",
-    description="按目录顺序批量提取PDF书籍，在后台逐本处理，立即返回。用 get_batch_status 查看进度。支持断点续传。",
+    description="按目录批量提取PDF书籍，在后台调度独立OCR worker，立即返回。用 get_batch_status 查看书本完成数、页数进度和资源调度。并发数会结合CPU线程、系统内存和每个worker的实际占用动态调整；支持断点续传。",
 )
 def batch_extract_library(
     root: str,
@@ -2002,23 +2506,31 @@ def batch_extract_library(
     max_books: int | None = None,
     max_pages_per_book: int | None = None,
     resume: bool = True,
+    max_workers: int | None = None,
 ) -> dict[str, Any]:
+    batch_kwargs: dict[str, Any] = {
+        "root": root,
+        "output_dir": output_dir,
+        "mode": mode,
+        "max_books": max_books,
+        "max_pages_per_book": max_pages_per_book,
+        "resume": resume,
+    }
+    if max_workers is not None:
+        batch_kwargs["max_workers"] = max_workers
     return zh_data(
-        _batch_manager.start_batch(
-            root=root,
-            output_dir=output_dir,
-            mode=mode,
-            max_books=max_books,
-            max_pages_per_book=max_pages_per_book,
-            resume=resume,
-        )
+        _batch_manager.start_batch(**batch_kwargs)
     )
 
 
 @mcp.tool(
     name="get_batch_status",
     title="查看批量任务状态",
-    description="查看批量提取的整体进度，并返回当前书籍的运行时间、剩余时间、书籍名、总处理页数、处理进度、处理速度和CPU/内存资源占用率。",
+    description=(
+        "查看批量提取的整体进度，返回书本完成数/总数、当前书籍运行时间、剩余时间、"
+        "总处理页数、处理进度、处理速度，以及每个 worker 的 PID、RSS 内存、实际进程线程数、"
+        "CPU 线程占用率和汇总资源指标。总 CPU 比例按整机逻辑 CPU 归一化，不把多核累计值误报为百分比。"
+    ),
 )
 def get_batch_status() -> dict[str, Any]:
     return zh_data(_batch_manager.status())
@@ -2031,6 +2543,67 @@ def get_batch_status() -> dict[str, Any]:
 )
 def stop_batch() -> dict[str, Any]:
     return zh_data(_batch_manager.stop())
+
+
+@mcp.tool(
+    name="plan_ocr_capacity_profile",
+    title="规划 OCR 容量基准",
+    description=(
+        "规划 1/2/3/4 线程单 worker 与多 worker 的隔离 OCR 吞吐基准。"
+        "只创建配置和私有样本计划；发现任意生产 OCR 正在运行时会标记为延期，不会占用当前任务资源。"
+    ),
+)
+def plan_ocr_capacity_profile(
+    source_pdf: str,
+    mode: str = "book-fast",
+    sample_pages: int = 8,
+    warmup_pages: int = 2,
+    max_workers: int | None = None,
+    candidate_threads: list[int] | None = None,
+) -> dict[str, Any]:
+    return zh_data(
+        _capacity_benchmark_manager.plan(
+            source_pdf=source_pdf,
+            mode=mode,
+            sample_pages=sample_pages,
+            warmup_pages=warmup_pages,
+            max_workers=max_workers,
+            candidate_threads=tuple(candidate_threads or (1, 2, 3, 4)),
+        )
+    )
+
+
+@mcp.tool(
+    name="start_ocr_capacity_profile",
+    title="启动 OCR 容量基准",
+    description=(
+        "在机器没有任何生产 OCR 时后台运行已规划的容量基准。"
+        "每个候选使用独立、不重叠的私有 PDF 页样本；调用立即返回，OCR 不会阻塞 MCP。"
+    ),
+)
+def start_ocr_capacity_profile(profile_id: str) -> dict[str, Any]:
+    return zh_data(_capacity_benchmark_manager.start(profile_id))
+
+
+@mcp.tool(
+    name="get_ocr_capacity_profile",
+    title="查看 OCR 容量基准",
+    description="读取容量基准的候选、逐 worker 线程资源样本、页吞吐、质量门禁和建议；不改变任何运行中任务。",
+)
+def get_ocr_capacity_profile(profile_id: str) -> dict[str, Any]:
+    return zh_data(_capacity_benchmark_manager.status(profile_id))
+
+
+@mcp.tool(
+    name="activate_ocr_capacity_profile",
+    title="激活 OCR 容量策略",
+    description=(
+        "显式激活已完成基准给出的建议，供之后启动的批处理 worker 使用。"
+        "不会热改、重启或中断已经运行的 OCR worker。"
+    ),
+)
+def activate_ocr_capacity_profile(profile_id: str) -> dict[str, Any]:
+    return zh_data(_capacity_benchmark_manager.activate(profile_id))
 
 
 _MCP_TRANSPORT_ALIASES = {

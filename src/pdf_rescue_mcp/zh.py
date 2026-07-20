@@ -8,6 +8,53 @@ KEYS = {
     "platform": "平台",
     "python": "运行环境版本",
     "cpu_count": "处理器核心数",
+    "physical_core_count": "物理核心数",
+    "system_cpu_percent": "整机CPU占用率",
+    "cpu_percent": "CPU占整机比例",
+    "cpu_core_equivalents": "CPU等效核心数",
+    "thread_cpu_percent": "线程CPU占用率",
+    "thread_sample_window_seconds": "线程采样窗口秒",
+    "pid": "进程ID",
+    "memory_mb": "内存MB",
+    "memory_percent": "内存占用率",
+    "available_memory_gb": "可用内存GB",
+    "total_memory_gb": "总内存GB",
+    "reserve_memory_gb": "内存保留水位GB",
+    "memory_per_worker_gb": "每worker内存预算GB",
+    "threads_per_worker": "每worker线程预算",
+    "configured_threads_total": "配置线程总数",
+    "next_worker_threads": "下一worker线程预算",
+    "used_saturated_threads": "已用饱和线程数",
+    "used_thread_slots": "已用线程槽",
+    "available_thread_slots": "可用线程槽",
+    "additional_memory_slots": "可新增内存worker数",
+    "external_cpu_percent": "外部CPU负载占比",
+    "throughput_pages_per_minute": "OCR吞吐页每分钟",
+    "tuning_profile_id": "吞吐调优配置ID",
+    "workers": "worker资源",
+    "key": "候选标识",
+    "candidate_workers": "并发worker数",
+    "pages_per_minute": "页每分钟",
+    "end_to_end_pages_per_minute": "端到端页每分钟",
+    "pages_per_configured_thread_minute": "每配置线程页每分钟",
+    "p50_seconds_per_page": "P50秒每页",
+    "measured_pages": "有效测量页数",
+    "elapsed_seconds": "试验耗时秒",
+    "failed_pages": "失败页数",
+    "low_confidence_ratio": "低置信页比例",
+    "system_cpu_percent_p95": "整机CPU P95",
+    "external_cpu_percent_p95": "外部CPU负载P95",
+    "available_memory_min_gb": "最小可用内存GB",
+    "total_rss_mb_p95": "总RSS内存P95 MB",
+    "thread_utilization_percent_p95": "线程利用率P95",
+    "saturated_thread_count_p95": "饱和线程数P95",
+    "per_worker_samples": "每worker资源采样",
+    "per_worker_summary": "每worker资源汇总",
+    "rejection_reasons": "淘汰原因",
+    "valid": "通过护栏",
+    "target_workers": "目标worker数",
+    "active_workers": "活跃worker数",
+    "hard_limit": "并发容量上限",
     "memory_gb": "内存GB",
     "gpu_available": "OCR可用显卡",
     "gpu": "显卡状态",
@@ -202,7 +249,11 @@ def zh_data(value: Any) -> Any:
         value = value.model_dump(mode="json")
     if isinstance(value, dict):
         return {
-            KEYS.get(str(key), VALUES.get(str(key), str(key))): zh_data(zh_value(item))
+            (
+                "并发worker数"
+                if str(key) == "workers" and not isinstance(item, (list, tuple))
+                else KEYS.get(str(key), VALUES.get(str(key), str(key)))
+            ): zh_data(zh_value(item))
             for key, item in value.items()
         }
     if isinstance(value, list):

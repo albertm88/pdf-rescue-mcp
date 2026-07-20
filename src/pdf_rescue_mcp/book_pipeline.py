@@ -4,6 +4,7 @@ import html
 import json
 import os
 import re
+import statistics
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ from .models import (
     ensure_path,
 )
 from .ocr_engines import (
+    _cpu_thread_count,
     available_ocr_engine,
     create_ocr_adapter,
     ocr_pdf_page,
@@ -34,6 +36,7 @@ from .zh import zh_data
 LOW_CONFIDENCE_THRESHOLD = 0.9
 LOW_CONFIDENCE_RETRY_DPI = 300
 LOW_CONFIDENCE_MIN_TEXT_RATIO = 0.85
+OCR_THROUGHPUT_WINDOW = 12
 TERM_GLOSSARY_PATH = Path(__file__).with_name("术语词表.yaml")
 
 
@@ -53,6 +56,46 @@ def _format_duration(seconds: float | int | None) -> str:
     if minutes:
         return f"{minutes}分{seconds_part}秒"
     return f"{seconds_part}秒"
+
+
+def _profile_warmup_pages() -> int:
+    """Read the optional isolated-profile warmup count from the worker env."""
+    try:
+        return max(0, int(os.environ.get("PDF_RESCUE_OCR_PROFILE_WARMUP_PAGES", "0")))
+    except ValueError:
+        return 0
+
+
+def _ocr_throughput_metrics(
+    durations: list[float],
+    *,
+    thread_budget: int,
+    warmup_pages: int,
+) -> dict[str, object]:
+    """Build a short window from real OCR calls only.
+
+    Cache hits, native-text reuse, and low-confidence retries must not alter
+    this window: they do not describe steady OCR engine throughput.
+    """
+    window = [max(0.001, float(value)) for value in durations[-OCR_THROUGHPUT_WINDOW:]]
+    if not window:
+        return {
+            "OCR线程预算": thread_budget,
+            "OCR性能预热页数": warmup_pages,
+            "OCR吞吐样本数": 0,
+            "短窗OCR中位秒每页": None,
+            "短窗OCR页每分钟": None,
+            "最近OCR页秒数": None,
+        }
+    median_seconds = statistics.median(window)
+    return {
+        "OCR线程预算": thread_budget,
+        "OCR性能预热页数": warmup_pages,
+        "OCR吞吐样本数": len(window),
+        "短窗OCR中位秒每页": round(median_seconds, 3),
+        "短窗OCR页每分钟": round(60.0 / median_seconds, 3),
+        "最近OCR页秒数": round(window[-1], 3),
+    }
 
 
 def _processing_metrics(status: dict) -> dict[str, object]:
@@ -111,7 +154,7 @@ def _processing_metrics(status: dict) -> dict[str, object]:
     if remaining_seconds is None and speed_seconds is not None:
         remaining_seconds = max(0, int(round(speed_seconds * max(target_pages - processed_pages, 0))))
 
-    return {
+    metrics = {
         "书籍名": book_name,
         "总处理页数": target_pages,
         "已处理页数": processed_pages,
@@ -124,6 +167,17 @@ def _processing_metrics(status: dict) -> dict[str, object]:
         "处理速度": speed_seconds,
         "处理速度文本": f"{speed_seconds:.2f}秒/页" if speed_seconds is not None else "未知",
     }
+    for key in (
+        "OCR线程预算",
+        "OCR性能预热页数",
+        "OCR吞吐样本数",
+        "短窗OCR中位秒每页",
+        "短窗OCR页每分钟",
+        "最近OCR页秒数",
+    ):
+        if key in status:
+            metrics[key] = status[key]
+    return metrics
 
 
 class _CancellationRequested(RuntimeError):
@@ -1881,6 +1935,16 @@ def _load_cached_page(cache_dir: Path, page_number: int) -> PageRecord | None:
     return PageRecord.model_validate(_read_json_with_retry(path))
 
 
+def _load_cached_pages(cache_dir: Path, target_pages: int) -> dict[int, PageRecord]:
+    """Read durable page-cache records keyed by their requested PDF page."""
+    records: dict[int, PageRecord] = {}
+    for page_number in range(1, target_pages + 1):
+        page = _load_cached_page(cache_dir, page_number)
+        if page is not None:
+            records[page_number] = page
+    return records
+
+
 def _write_cached_page(cache_dir: Path, page: PageRecord) -> None:
     path = _cache_path(cache_dir, page.page_number)
     _write_json(path, page.model_dump(mode="json"))
@@ -1904,6 +1968,7 @@ def _write_status(
     mode: str | None = None,
     ocr_device: str | None = None,
     gpu_confirmed: bool = False,
+    ocr_timing: dict[str, object] | None = None,
 ) -> None:
     now = datetime.now()
     payload = {
@@ -1940,6 +2005,26 @@ def _write_status(
         payload["是否抽样"] = is_sample
     if mode:
         payload["模式"] = zh_data(mode)
+    if ocr_timing is None:
+        # The final authoritative status write happens outside the page loop.
+        # Preserve the last sampled OCR window instead of replacing it with the
+        # coarse whole-job average.
+        try:
+            previous = _read_json_with_retry(path)
+        except Exception:
+            previous = {}
+        for key in (
+            "OCR线程预算",
+            "OCR性能预热页数",
+            "OCR吞吐样本数",
+            "短窗OCR中位秒每页",
+            "短窗OCR页每分钟",
+            "最近OCR页秒数",
+        ):
+            if key in previous:
+                payload[key] = previous[key]
+    else:
+        payload.update(ocr_timing)
     # 业务层把页级指标写入状态文件，CLI、批量管理器和MCP查询共享同一来源。
     metrics = _processing_metrics(payload)
     payload.update(
@@ -2110,10 +2195,11 @@ def _extract_ocr_pages_resumable(
     progress_callback: "Callable[[int, int, float, str | None], None] | None" = None,
     stop_flag: object | None = None,
 ) -> tuple[str, list[PageRecord], list[dict], list[dict]]:
+    cached_by_number: dict[int, PageRecord] = {}
     if resume:
-        cached_pages = [_load_cached_page(cache_dir, page_number) for page_number in range(1, target_pages + 1)]
-        if all(page is not None for page in cached_pages):
-            pages = [page for page in cached_pages if page is not None]
+        cached_by_number = _load_cached_pages(cache_dir, target_pages)
+        if len(cached_by_number) == target_pages:
+            pages = [cached_by_number[page_number] for page_number in range(1, target_pages + 1)]
             for page in pages:
                 if _prepare_cached_ocr_page(page, book_title=book_title):
                     _write_cached_page(cache_dir, page)
@@ -2166,19 +2252,28 @@ def _extract_ocr_pages_resumable(
     reported_engine = f"{engine_name}_hybrid" if direct_pages else engine_name
     medium_adapter_cache: tuple[str, object] | None = None
     pages: list[PageRecord] = []
+    processed_by_number = dict(cached_by_number)
     failed_reports: list[dict] = []
-    low_reports: list[dict] = []
+    low_reports = _low_confidence_reports(list(processed_by_number.values()))
+    ocr_durations: list[float] = []
+    ocr_thread_budget = _cpu_thread_count()
+    warmup_pages = _profile_warmup_pages()
+
+    def processed_pages_snapshot() -> list[PageRecord]:
+        return [processed_by_number[page_number] for page_number in sorted(processed_by_number)]
+
+    initial_pages = processed_pages_snapshot()
 
     _write_status(
         status_path,
         source_pdf=pdf_path,
         status="进行中",
         target_pages=target_pages,
-        processed_pages=0,
-        text_pages=0,
-        blank_pages=0,
+        processed_pages=len(initial_pages),
+        text_pages=sum(1 for item in initial_pages if item.text.strip()),
+        blank_pages=sum(1 for item in initial_pages if item.source == "blank_page"),
         failed_pages=0,
-        low_confidence_pages=0,
+        low_confidence_pages=len(low_reports),
         engine=reported_engine,
         total_pages=total_pages,
         is_sample=is_sample,
@@ -2186,6 +2281,11 @@ def _extract_ocr_pages_resumable(
         mode=mode,
         ocr_device=ocr_device,
         gpu_confirmed=gpu_confirmed,
+        ocr_timing=_ocr_throughput_metrics(
+            ocr_durations,
+            thread_budget=ocr_thread_budget,
+            warmup_pages=warmup_pages,
+        ),
     )
     if failed_path:
         _write_jsonl(failed_path, failed_reports)
@@ -2200,14 +2300,15 @@ def _extract_ocr_pages_resumable(
 
     for page_number in range(1, target_pages + 1):
         if callable(stop_requested) and stop_requested():
+            cancelled_pages = processed_pages_snapshot()
             _write_status(
                 status_path,
                 source_pdf=pdf_path,
                 status="已取消",
                 target_pages=target_pages,
-                processed_pages=len(pages),
-                text_pages=sum(1 for item in pages if item.text.strip()),
-                blank_pages=sum(1 for item in pages if item.source == "blank_page"),
+                processed_pages=len(cancelled_pages),
+                text_pages=sum(1 for item in cancelled_pages if item.text.strip()),
+                blank_pages=sum(1 for item in cancelled_pages if item.source == "blank_page"),
                 failed_pages=len(failed_reports),
                 low_confidence_pages=len(low_reports),
                 engine=reported_engine,
@@ -2217,6 +2318,11 @@ def _extract_ocr_pages_resumable(
                 mode=mode,
                 ocr_device=ocr_device,
                 gpu_confirmed=gpu_confirmed,
+                ocr_timing=_ocr_throughput_metrics(
+                    ocr_durations,
+                    thread_budget=ocr_thread_budget,
+                    warmup_pages=warmup_pages,
+                ),
             )
             raise _CancellationRequested("OCR任务已在页边界停止")
         # This is intentionally before loading a cache or calling OCR.  It gives the
@@ -2239,8 +2345,16 @@ def _extract_ocr_pages_resumable(
                 ocr_kwargs = {"adapter": adapter, "engine_name": engine_name, "dpi": dpi}
                 if password is not None:
                     ocr_kwargs["password"] = password
+                ocr_started_at = time.monotonic()
                 _, page = ocr_pdf_page(pdf_path, page_number, **ocr_kwargs)
+                ocr_seconds = max(0.001, time.monotonic() - ocr_started_at)
                 page = _prepare_ocr_page(page, book_title=book_title)
+                # A successfully OCRed page is the durable resume boundary.
+                # Without this flag, ordinary high-confidence pages remain
+                # only in memory and a later restart re-runs them from page 1.
+                cache_dirty = True
+                if page_number > warmup_pages:
+                    ocr_durations.append(ocr_seconds)
             except Exception as exc:
                 page = PageRecord(
                     page_number=page_number,
@@ -2276,8 +2390,9 @@ def _extract_ocr_pages_resumable(
             _write_cached_page(cache_dir, page)
 
         pages.append(page)
-        if _needs_low_confidence_review(page):
-            low_reports.append(_low_confidence_report(page))
+        processed_by_number[page_number] = page
+        current_pages = processed_pages_snapshot()
+        low_reports = _low_confidence_reports(current_pages)
         if pending_failure_report and not page.text.strip():
             failed_reports.append(pending_failure_report)
         if failed_path:
@@ -2290,9 +2405,9 @@ def _extract_ocr_pages_resumable(
             source_pdf=pdf_path,
             status="进行中",
             target_pages=target_pages,
-            processed_pages=len(pages),
-            text_pages=sum(1 for item in pages if item.text.strip()),
-            blank_pages=sum(1 for item in pages if item.source == "blank_page"),
+            processed_pages=len(current_pages),
+            text_pages=sum(1 for item in current_pages if item.text.strip()),
+            blank_pages=sum(1 for item in current_pages if item.source == "blank_page"),
             failed_pages=len(failed_reports),
             low_confidence_pages=len(low_reports),
             engine=reported_engine,
@@ -2302,6 +2417,11 @@ def _extract_ocr_pages_resumable(
             mode=mode,
             ocr_device=ocr_device,
             gpu_confirmed=gpu_confirmed,
+            ocr_timing=_ocr_throughput_metrics(
+                ocr_durations,
+                thread_budget=ocr_thread_budget,
+                warmup_pages=warmup_pages,
+            ),
         )
         # The cache, failure/low-confidence records, and business status have all
         # committed atomically at this point.  Only now is it correct to advance
@@ -2314,21 +2434,22 @@ def _extract_ocr_pages_resumable(
         if progress_callback is not None:
             now = datetime.now()
             elapsed = max(0.0, (now - started_at).total_seconds()) if started_at else 0.0
-            avg = elapsed / len(pages) if pages else 0.0
-            remaining = max(target_pages - len(pages), 0)
+            processed_count = len(current_pages)
+            avg = elapsed / processed_count if processed_count else 0.0
+            remaining = max(target_pages - processed_count, 0)
             eta = round(remaining * avg) if avg else None
-            pct = round(len(pages) / target_pages * 100, 1) if target_pages else 0.0
+            pct = round(processed_count / target_pages * 100, 1) if target_pages else 0.0
             eta_text = f"{eta}秒（约{eta // 60}分）" if eta is not None else "未知"
             msg = (
-                f"第 {len(pages)}/{target_pages} 页 | {pct}% | "
+                f"第 {processed_count}/{target_pages} 页 | {pct}% | "
                 f"平均 {round(avg, 1)}秒/页 | 剩余 {eta_text}"
             )
             try:
-                progress_callback(len(pages), target_pages, pct, msg)
+                progress_callback(processed_count, target_pages, pct, msg)
             except Exception:
                 pass
 
-    return reported_engine, pages, failed_reports, low_reports
+    return reported_engine, processed_pages_snapshot(), failed_reports, low_reports
 
 
 def _write_markdown(path: Path, source_pdf: Path, pages: list[PageRecord]) -> None:
@@ -3002,6 +3123,14 @@ def extract_book_text(
             except _CancellationRequested:
                 status = "cancelled"
                 engine = "cancelled"
+                # A cooperative stop can arrive before the resumed worker has
+                # walked cached pages in this process.  The cache is the
+                # durable progress boundary, so rebuild the outward metrics
+                # from it instead of overwriting them with an empty list.
+                if resume:
+                    cached_by_number = _load_cached_pages(cache_dir, target_pages)
+                    pages = [cached_by_number[number] for number in sorted(cached_by_number)]
+                    low_reports = _low_confidence_reports(pages)
                 warnings.append("OCR任务已收到停止请求，已在安全页边界停止；可用恢复任务继续。")
                 next_steps.append("如需继续，请使用恢复任务从逐页缓存断点续传。")
             except Exception:

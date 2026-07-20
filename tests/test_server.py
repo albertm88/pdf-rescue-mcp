@@ -14,6 +14,71 @@ class FakeProcess:
     pid = 24680
 
 
+def test_restored_batch_continues_after_existing_active_workers() -> None:
+    manager = server._BatchManager()
+    manager._current_index = 5
+    manager._active_jobs = {
+        "chemistry": {"索引": 4},
+        "history": {"索引": 5},
+    }
+
+    assert manager._next_book_index() == 6
+
+
+def test_batch_without_active_workers_keeps_saved_resume_index() -> None:
+    manager = server._BatchManager()
+    manager._current_index = 5
+
+    assert manager._next_book_index() == 5
+
+
+def test_batch_restarts_cancelled_active_job_before_admitting_new_book(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    job_dir = tmp_path / "书-rescue-result"
+    job_dir.mkdir()
+    (job_dir / "状态.json").write_text(json.dumps({"状态": "已取消"}), encoding="utf-8")
+    source_pdf = tmp_path / "书.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    manager = server._BatchManager()
+    manager._running = True
+    manager._resume = True
+    manager._mode = "book-fast"
+    manager._active_jobs = {
+        str(job_dir): {
+            "索引": 5,
+            "书名": "书",
+            "任务目录": str(job_dir),
+            "来源PDF": str(source_pdf),
+            "线程预算": 4,
+        }
+    }
+    calls: list[dict] = []
+
+    class FakeTaskManager:
+        def get_task_info(self, _job_dir: str) -> dict:
+            return {"存活": False}
+
+        def start_extraction(self, **kwargs):
+            calls.append(kwargs)
+            return str(job_dir), False
+
+    monkeypatch.setattr(server, "_task_manager", FakeTaskManager())
+
+    assert manager._resume_cancelled_active_jobs() is True
+    assert calls == [{
+        "path": str(source_pdf),
+        "output_dir": str(job_dir.parent),
+        "mode": "book-fast",
+        "max_pages": None,
+        "resume": True,
+        "password": None,
+        "ocr_threads": 4,
+    }]
+
+
 def test_get_job_status_exposes_metrics_and_worker_resources(tmp_path: Path, monkeypatch) -> None:
     job_dir = tmp_path / "书籍-rescue-result"
     job_dir.mkdir()
@@ -88,6 +153,15 @@ def test_batch_status_exposes_current_book_metrics(tmp_path: Path, monkeypatch) 
     manager._books = [{"文件名": "书.pdf", "PDF路径": str(tmp_path / "书.pdf")}]
     manager._current_index = 0
     manager._current_job_dir = str(job_dir)
+    manager._active_jobs = {
+        str(job_dir): {
+            "索引": 0,
+            "书名": "书",
+            "任务目录": str(job_dir),
+            "来源PDF": str(tmp_path / "书.pdf"),
+            "线程预算": 2,
+        }
+    }
     manager._started_at = 0
     monkeypatch.setattr(server, "_task_manager", type("TaskManager", (), {
         "get_task_info": lambda _self, _job_dir: {
@@ -99,16 +173,103 @@ def test_batch_status_exposes_current_book_metrics(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(
         server,
         "collect_process_resource_usage",
-        lambda pid: {"状态": "可用", "进程ID": pid, "CPU占用率": 12.0, "内存占用率": 2.0},
+        lambda pid: {
+            "状态": "可用",
+            "进程ID": pid,
+            "CPU占用率": 12.0,
+            "CPU等效核心数": 1.92,
+            "线程CPU占用率": {"10": 100.0, "11": 92.0},
+            "进程线程数": 27,
+            "活跃CPU线程数": 2,
+            "饱和CPU线程数": 2,
+            "内存MB": 512.0,
+            "内存占用率": 2.0,
+            "运行内存占用MB": 512.0,
+            "运行内存占整机比例": 2.0,
+        },
     )
 
     result = manager.status()
 
     assert result["书籍名"] == "书"
+    assert result["书本总数"] == 1
+    assert result["书本完成数"] == 0
+    assert result["书本失败数"] == 0
+    assert result["书本待处理数"] == 0
+    assert result["进行中书本数"] == 1
     assert result["总处理页数"] == 20
     assert result["处理进度"] == 25.0
     assert result["处理速度"] == 60.0
     assert result["当前书籍指标"]["资源占用率"]["CPU占用率"] == 12.0
+    assert result["worker数"] == 1
+    assert result["已取得PID的worker数"] == 1
+    assert result["可采样worker数"] == 1
+    assert result["worker总占用内存MB"] == 512.0
+    assert result["worker总运行内存占用MB"] == 512.0
+    assert result["worker总进程线程数"] == 27
+    assert result["worker资源"][0]["进程线程数"] == 27
+    assert result["worker资源"][0]["线程CPU占用率"] == {"10": 100.0, "11": 92.0}
+    assert result["worker资源"][0]["运行内存占用MB"] == 512.0
+    assert result["worker资源汇总"]["总OCR线程预算"] == 2
+    assert result["worker资源汇总"]["总活跃CPU线程数"] == 2
+    assert result["worker资源汇总"]["总饱和CPU线程数"] == 2
+    assert result["worker资源汇总"]["总运行内存占用MB"] == 512.0
+    assert result["worker资源汇总"]["采样完整"] is True
+
+
+def test_worker_resource_summary_preserves_missing_worker_samples() -> None:
+    summary = server._worker_resource_summary(
+        [
+            {
+                "进程ID": 101,
+                "线程预算": 4,
+                "资源占用率": {
+                    "状态": "可用",
+                    "CPU等效核心数": 1.5,
+                    "内存MB": 800.0,
+                    "进程线程数": 31,
+                    "活跃CPU线程数": 4,
+                    "饱和CPU线程数": 2,
+                    "线程CPU占用率": {"1": 100.0},
+                },
+            },
+            {
+                "进程ID": 102,
+                "线程预算": 2,
+                "资源占用率": {
+                    "状态": "可用",
+                    "CPU等效核心数": 0.5,
+                    "内存MB": 400.0,
+                    "进程线程数": 19,
+                    "活跃CPU线程数": 1,
+                    "饱和CPU线程数": 0,
+                    "线程CPU占用率": {"2": 50.0},
+                },
+            },
+            {
+                "进程ID": None,
+                "线程预算": 2,
+                "资源占用率": {"状态": "不可用", "进程线程数": None},
+            },
+        ],
+        logical_cpu_count=16,
+        total_memory_mb=16 * 1024,
+    )
+
+    assert summary["统计worker数"] == 3
+    assert summary["已取得PID的worker数"] == 2
+    assert summary["可采样worker数"] == 2
+    assert summary["不可采样worker数"] == 1
+    assert summary["线程采样worker数"] == 2
+    assert summary["采样完整"] is False
+    assert summary["总OCR线程预算"] == 8
+    assert summary["总进程线程数"] == 50
+    assert summary["总活跃CPU线程数"] == 5
+    assert summary["总饱和CPU线程数"] == 2
+    assert summary["总RSS内存MB"] == 1200.0
+    assert summary["总内存占整机比例"] == 7.32
+    assert summary["总CPU等效核心数"] == 2.0
+    assert summary["总CPU占整机比例"] == 12.5
 
 
 def test_mcp_transport_defaults_to_stdio(monkeypatch) -> None:
@@ -208,6 +369,137 @@ def test_background_book_extraction_returns_task_information(
     manager._stopping = True
 
 
+def test_background_task_is_live_during_startup_grace_before_first_heartbeat(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(paths, "PROJECT_ROOT", tmp_path)
+    manager = server._TaskManager()
+    source = tmp_path / "扫描书.pdf"
+    source.write_bytes(b"not inspected by the launcher")
+
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+
+    job_dir, already_running = manager.start_extraction(
+        str(source),
+        output_dir=str(tmp_path / "输出"),
+        mode="book-fast",
+        max_pages=None,
+        resume=True,
+        password=None,
+    )
+    health = manager.get_task_info(job_dir)
+
+    assert already_running is False
+    assert health and health["存活"] is True
+    assert health["心跳"]["活跃"] is False
+    assert health["监控阶段"] == "启动中"
+    manager._stopping = True
+
+
+def test_cancelled_task_restarts_despite_reused_heartbeat_pid(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(paths, "PROJECT_ROOT", tmp_path)
+    source = tmp_path / "扫描书.pdf"
+    source.write_bytes(b"not inspected by the launcher")
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_popen(command: list[str], **kwargs):
+        calls.append((command, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    first_manager = server._TaskManager()
+    job_dir, first_already_running = first_manager.start_extraction(
+        str(source),
+        output_dir=str(tmp_path / "输出"),
+        mode="book-fast",
+        max_pages=None,
+        resume=True,
+        password=None,
+    )
+    result_dir = Path(job_dir)
+    (result_dir / "状态.json").write_text('{"状态":"已取消"}', encoding="utf-8")
+    (result_dir / "后台任务心跳.json").write_text(
+        '{"状态":"已取消","进程ID":97531}', encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        server._TaskManager,
+        "_pid_alive",
+        staticmethod(lambda _pid: True),
+    )
+
+    restarted_manager = server._TaskManager()
+    restarted_job_dir, restarted_already_running = restarted_manager.start_extraction(
+        str(source),
+        output_dir=str(tmp_path / "输出"),
+        mode="book-fast",
+        max_pages=None,
+        resume=True,
+        password=None,
+    )
+
+    assert first_already_running is False
+    assert restarted_already_running is False
+    assert restarted_job_dir == job_dir
+    assert len(calls) == 2
+    first_manager._stopping = True
+    restarted_manager._stopping = True
+
+
+def test_durable_cancelled_orphan_is_requeued_for_explicit_resume(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("PDF_RESCUE_RUNTIME_ROOT", str(tmp_path / "runtime-layout"))
+    database_path = tmp_path / "runtime" / "tasks.sqlite3"
+    source = tmp_path / "扫描书.pdf"
+    source.write_bytes(b"not inspected by the launcher")
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_popen(command: list[str], **kwargs):
+        calls.append((command, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    first_supervisor = server.LocalSupervisor(database_path=database_path, owner_id="old-owner")
+    first_manager = server._TaskManager(enable_durable_supervision=True, supervisor=first_supervisor)
+    job_dir, _ = first_manager.start_extraction(
+        str(source),
+        output_dir=str(tmp_path / "输出"),
+        mode="book-fast",
+        max_pages=None,
+        resume=True,
+        password=None,
+    )
+    first_info = first_manager._tasks[job_dir]
+    first_context = first_info["supervision_context"]
+    first_supervisor.store.release_lease(
+        first_context.lease.resource_key,
+        owner_id=first_supervisor.owner_id,
+        token=first_context.lease.token,
+    )
+    result_dir = Path(job_dir)
+    (result_dir / "状态.json").write_text('{"状态":"已取消"}', encoding="utf-8")
+
+    resumed_supervisor = server.LocalSupervisor(database_path=database_path, owner_id="new-owner")
+    resumed_manager = server._TaskManager(enable_durable_supervision=True, supervisor=resumed_supervisor)
+    resumed_job_dir, already_running = resumed_manager.start_extraction(
+        str(source),
+        output_dir=str(tmp_path / "输出"),
+        mode="book-fast",
+        max_pages=None,
+        resume=True,
+        password=None,
+    )
+
+    task_id = first_info["持久任务ID"]
+    assert resumed_job_dir == job_dir
+    assert already_running is False
+    assert len(calls) == 2
+    assert resumed_supervisor.store.get_task(task_id).state == "running"
+    assert resumed_supervisor.store.get_task(task_id).latest_attempt_number == 2
+    first_manager._stopping = True
+    resumed_manager._stopping = True
+
+
 def test_background_book_extraction_avoids_windows_flags_on_linux(
     tmp_path: Path,
     monkeypatch,
@@ -264,6 +556,35 @@ def test_background_task_passes_password_only_through_child_environment(tmp_path
     assert "only-for-this-call" not in command
     assert "only-for-this-call" not in json.dumps(metadata, ensure_ascii=False)
     assert "only-for-this-call" not in json.dumps(task_state, ensure_ascii=False)
+    manager._stopping = True
+
+
+def test_background_task_passes_profile_thread_and_warmup_environment(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(paths, "PROJECT_ROOT", tmp_path)
+    manager = server._TaskManager()
+    source = tmp_path / "capacity-sample.pdf"
+    source.write_bytes(b"not inspected by the launcher")
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_popen(command: list[str], **kwargs):
+        calls.append((command, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    manager.start_extraction(
+        str(source),
+        output_dir=str(tmp_path / "output"),
+        mode="book-fast",
+        max_pages=10,
+        resume=False,
+        password=None,
+        ocr_threads=4,
+        ocr_profile_warmup_pages=2,
+    )
+
+    environment = calls[0][1]["env"]
+    assert environment["PDF_RESCUE_OCR_THREADS"] == "4"
+    assert environment["PDF_RESCUE_OCR_PROFILE_WARMUP_PAGES"] == "2"
     manager._stopping = True
 
 

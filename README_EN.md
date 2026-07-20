@@ -12,7 +12,7 @@ The detailed Chinese runtime boundary, recovery state machine, and portability p
 
 - **One-Click Rescue**: Single `rescue_pdf` tool automates the full pipeline: diagnose → plan → extract → audit
 - **Three-Layer Runtime**: Business layer (isolated OCR and atomic page cache) + Supervision layer (SQLite lease, heartbeat/page-progress watchdog, portable process control) + Iteration layer (auditable advisory plans only)
-- **Batch Processing**: Background thread iterates books sequentially, MCP server stays responsive with real-time progress
+- **Batch Processing**: Independent OCR workers keep MCP responsive; concurrency is based on worker thread budgets, per-thread utilization, RSS, external load, and measured OCR throughput—not a misleading aggregate process CPU percentage
 - **Resume from Breakpoints**: Per-page caching, auto-resume from last checkpoint after interruption
 - **Quality Auditing**: Low-confidence page detection, failed page logging, page evidence export
 - **CPU/GPU Auto-Detection**: Automatically detects NVIDIA GPU acceleration; CPU mode with optimized thread count
@@ -145,9 +145,30 @@ Use `http://127.0.0.1:8765/mcp` as the MCP URL. For cross-machine access, put th
 | Tool | Description |
 |------|-------------|
 | `batch_extract_library` | Batch extract library, processes books sequentially in background, returns immediately. |
-| `get_batch_status` | View batch progress (total books, completed, current book, ETA). |
+| `get_batch_status` | View completed/total books, current book pages, ETA, worker resources, and scheduling evidence. |
+
+For resources, `CPU占用率` is always the worker's share of total logical CPU capacity (0–100%). Cumulative multi-thread load is reported as `CPU等效核心数`, while `线程CPU占用率` lists each thread ID separately and never exceeds 100% per thread.
 | `stop_batch` | Stop batch (current book will finish, no new books started). |
 | `scan_pdf_library` | Scan library directory, generate PDF manifest with recommended actions. |
+
+### OCR Capacity Profiling
+
+| Tool | Description |
+|------|-------------|
+| `plan_ocr_capacity_profile` | Plan an isolated 2/4/6/8-thread and multi-worker profile from a source PDF. It reports `deferred` without starting work whenever production OCR is active. |
+| `start_ocr_capacity_profile` | Start a previously planned profile in the background only while no production OCR is detected. Each candidate uses private, non-overlapping fixture pages and does not block MCP. |
+| `get_ocr_capacity_profile` | Read candidate throughput, per-worker RSS, active/saturated-thread samples, per-thread utilization, quality gates, and the advisory recommendation. |
+| `activate_ocr_capacity_profile` | Explicitly activate a fully completed recommendation for future workers only. It never hot-reconfigures, restarts, or interrupts a running worker. |
+
+On a 16-logical-thread host the default matrix includes single-worker `1x2`,
+`1x4`, `1x6`, and `1x8`, then safe multi-worker candidates up to the logical
+thread budget after the system reserve (for example `2x2`, `2x4`, `2x6`,
+`3x2`, `3x4`, `4x2`). Candidates run serially; workers within one candidate
+run concurrently. The fastest result is not automatically selected: results
+within 5% of the peak prefer lower configured concurrency, then lower RSS and
+more sustainable thread utilization. Failed pages, quality regression, low
+memory, or unsafe CPU samples reject a candidate. A profile is advisory until
+the explicit activation tool is called.
 
 ### Diagnostics & Planning
 
@@ -256,7 +277,7 @@ Long-lived supervision state uses OS-standard per-user directories: `%APPDATA%` 
 ### CPU Thread Configuration
 
 - Auto-detects CPU core count, reserves 2 cores for system
-- Thread count capped at physical core count (typically 8 threads) to avoid HyperThreading contention
+- Normal batch starts remain conservative; the capacity profile can measure 2/4/6/8 threads and multi-worker combinations inside the logical-thread budget after the system reserve, then select using throughput, per-thread utilization, and RSS
 - AMD Ryzen 7 5800H (8 cores/16 threads) tested: book-fast mode ~8-15s/page
 
 ### GPU Acceleration

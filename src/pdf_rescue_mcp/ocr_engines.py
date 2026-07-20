@@ -72,6 +72,14 @@ class OcrLine:
 
 
 def _cpu_thread_count(logical_processors: int | None = None) -> int:
+    configured = os.environ.get("PDF_RESCUE_OCR_THREADS")
+    if configured and logical_processors is None:
+        try:
+            requested = int(configured)
+        except ValueError:
+            requested = 0
+        if requested > 0:
+            return max(1, min(4, requested))
     count = logical_processors if logical_processors is not None else os.cpu_count()
     count = count or 1
     # 线程数优化：
@@ -79,11 +87,12 @@ def _cpu_thread_count(logical_processors: int | None = None) -> int:
     # - 超过物理核心数(8)后HyperThreading收益递减，反而因争抢变慢
     # - 保留2个逻辑核给系统+MCP服务
     # - AMD Ryzen 7 5800H: 8物理核/16逻辑核 -> 最优6-8线程
+    # Batch workers deliberately stay within the 1–4 thread scheduling contract.
     physical_cores = count // 2 if count >= 8 else count  # 粗略估算物理核数
     # Do not reserve both cores on a two-core machine: that would make a
     # nominally dual-core device run a single OCR thread for no benefit.
     reserved = 2 if count >= 4 else 0
-    optimal = min(physical_cores, 8)  # 上限8线程，避免过度争抢
+    optimal = min(physical_cores, 4)  # 上限4线程，避免过度争抢
     return max(1, min(count - reserved, optimal))
 
 

@@ -16,6 +16,7 @@ from pdf_rescue_mcp.book_pipeline import (
     get_term_glossary,
     read_job_status,
     resume_job,
+    _ocr_throughput_metrics,
     _extract_ocr_pages_resumable,
     _chunk_page_text,
     _is_diagram_like_page,
@@ -27,12 +28,189 @@ from pdf_rescue_mcp.book_pipeline import (
     _write_cached_page,
     _write_status,
 )
-from pdf_rescue_mcp.models import PageRecord
+from pdf_rescue_mcp.models import PageRecord, PdfType, RecommendedAction, TextLayerInspection
 from pdf_rescue_mcp.task_store import TaskStore
 
 
 class FakeAdapter:
     pass
+
+
+def test_partial_resume_keeps_cached_progress_when_cancelled(tmp_path: Path, monkeypatch) -> None:
+    cache_dir = tmp_path / "缓存"
+    status_path = tmp_path / "状态.json"
+    for page_number in (1, 2):
+        _write_cached_page(
+            cache_dir,
+            PageRecord(
+                page_number=page_number,
+                text=f"已缓存第 {page_number} 页",
+                confidence=0.99,
+                source="paddleocr",
+            ),
+        )
+
+    class StopAtFirstBoundary:
+        calls = 0
+
+        def is_set(self) -> bool:
+            self.calls += 1
+            return self.calls >= 2
+
+    monkeypatch.setattr(
+        "pdf_rescue_mcp.book_pipeline.create_ocr_adapter",
+        lambda model_size="small": ("paddleocr", FakeAdapter()),
+    )
+
+    with pytest.raises(book_pipeline._CancellationRequested):
+        _extract_ocr_pages_resumable(
+            Path("书.pdf"),
+            cache_dir,
+            status_path,
+            target_pages=3,
+            resume=True,
+            dpi=180,
+            stop_flag=StopAtFirstBoundary(),
+        )
+
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["状态"] == "已取消"
+    assert status["已处理页数"] == 2
+
+
+def test_public_cancelled_resume_rebuilds_metrics_from_page_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_pdf = tmp_path / "book.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    output_dir = tmp_path / "输出"
+    job_dir = output_dir / "book-rescue-result"
+    cache_dir = job_dir / "缓存" / "页面OCR"
+    for page_number in (1, 2):
+        _write_cached_page(
+            cache_dir,
+            PageRecord(
+                page_number=page_number,
+                text=f"已缓存第 {page_number} 页",
+                confidence=0.99,
+                source="paddleocr",
+            ),
+        )
+
+    inspection = TextLayerInspection(
+        path=str(source_pdf),
+        page_count=3,
+        inspected_pages=3,
+        pdf_type=PdfType.IMAGE_ONLY_SCANNED,
+        has_extractable_text=False,
+        has_outline=False,
+        has_toc_like_pages=False,
+        text_layer_quality=0.0,
+        garble_risk=0.0,
+        coverage_score=0.0,
+        scanned_page_ratio=1.0,
+        text_page_ratio=0.0,
+        recommended_action=RecommendedAction.FULL_BOOK_OCR,
+        pages=[],
+    )
+
+    class AlreadyStopped:
+        def is_set(self) -> bool:
+            return True
+
+    monkeypatch.setattr("pdf_rescue_mcp.book_pipeline.inspect_pdf_text_layer", lambda *_args, **_kwargs: inspection)
+    monkeypatch.setattr("pdf_rescue_mcp.book_pipeline.available_ocr_engine", lambda: "paddleocr")
+
+    result = book_pipeline.extract_book_text(
+        source_pdf,
+        output_dir=output_dir,
+        mode="book-fast",
+        resume=True,
+        stop_flag=AlreadyStopped(),
+    )
+
+    status = json.loads((job_dir / "状态.json").read_text(encoding="utf-8"))
+    assert result.status == "cancelled"
+    assert status["状态"] == "已取消"
+    assert status["已处理页数"] == 2
+
+
+def test_partial_resume_starts_from_cache_and_ocrs_only_missing_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "缓存"
+    status_path = tmp_path / "状态.json"
+    for page_number in (1, 2):
+        _write_cached_page(
+            cache_dir,
+            PageRecord(
+                page_number=page_number,
+                text=f"已缓存第 {page_number} 页",
+                confidence=0.99,
+                source="paddleocr",
+            ),
+        )
+
+    calls: list[int] = []
+    progress_counts: list[int] = []
+
+    def fake_ocr_page(
+        _pdf_path: Path,
+        page_number: int,
+        *,
+        adapter: FakeAdapter,
+        engine_name: str,
+        dpi: int,
+        password=None,
+    ) -> tuple[str, PageRecord]:
+        calls.append(page_number)
+        return engine_name, PageRecord(
+            page_number=page_number,
+            text="新识别页面",
+            confidence=0.99,
+            source=engine_name,
+        )
+
+    monkeypatch.setattr(
+        "pdf_rescue_mcp.book_pipeline.create_ocr_adapter",
+        lambda model_size="small": ("paddleocr", FakeAdapter()),
+    )
+    monkeypatch.setattr("pdf_rescue_mcp.book_pipeline.ocr_pdf_page", fake_ocr_page)
+
+    _engine, pages, _failures, _low = _extract_ocr_pages_resumable(
+        Path("书.pdf"),
+        cache_dir,
+        status_path,
+        target_pages=3,
+        resume=True,
+        dpi=180,
+        progress_callback=lambda processed, _total, _pct, _message: progress_counts.append(processed),
+    )
+
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert calls == [3]
+    assert [page.page_number for page in pages] == [1, 2, 3]
+    assert progress_counts[0] == 2
+    assert status["已处理页数"] == 3
+
+
+def test_ocr_throughput_window_uses_real_ocr_duration_samples_only() -> None:
+    metrics = _ocr_throughput_metrics(
+        [float(value) for value in range(1, 20)],
+        thread_budget=6,
+        warmup_pages=2,
+    )
+
+    # The rolling window contains the last 12 calls (8..19), not any coarse
+    # whole-job average or cache/native-text timing supplied by a caller.
+    assert metrics["OCR线程预算"] == 6
+    assert metrics["OCR性能预热页数"] == 2
+    assert metrics["OCR吞吐样本数"] == 12
+    assert metrics["短窗OCR中位秒每页"] == 13.5
+    assert metrics["最近OCR页秒数"] == 19.0
+    assert metrics["短窗OCR页每分钟"] == round(60.0 / 13.5, 3)
 
 
 def test_term_glossary_is_readable_for_agents() -> None:
@@ -813,6 +991,68 @@ def test_cached_low_confidence_page_is_retried_and_cache_updated(
     assert failed_reports == []
     assert low_reports == []
     assert _load_cached_page(cache_dir, 1) == pages[0]
+
+
+def test_successful_ocr_page_is_cached_for_a_later_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "缓存"
+    status_path = tmp_path / "状态.json"
+
+    def fake_create_adapter(model_size: str = "small") -> tuple[str, FakeAdapter]:
+        return "paddleocr", FakeAdapter()
+
+    def fake_ocr_page(
+        pdf_path: Path,
+        page_number: int,
+        *,
+        adapter: FakeAdapter,
+        engine_name: str,
+        dpi: int,
+    ) -> tuple[str, PageRecord]:
+        return engine_name, PageRecord(
+            page_number=page_number,
+            text="这是可恢复的高置信度正文内容。" * 8,
+            confidence=0.99,
+            source=engine_name,
+            warnings=[],
+        )
+
+    monkeypatch.setattr("pdf_rescue_mcp.book_pipeline.create_ocr_adapter", fake_create_adapter)
+    monkeypatch.setattr("pdf_rescue_mcp.book_pipeline.ocr_pdf_page", fake_ocr_page)
+
+    engine, pages, failed_reports, low_reports = _extract_ocr_pages_resumable(
+        Path("书.pdf"),
+        cache_dir,
+        status_path,
+        target_pages=1,
+        resume=True,
+        dpi=220,
+    )
+
+    assert engine == "paddleocr"
+    assert failed_reports == []
+    assert low_reports == []
+    assert _load_cached_page(cache_dir, 1) == pages[0]
+
+    def fail_create_adapter(model_size: str = "small") -> tuple[str, FakeAdapter]:
+        raise AssertionError("已缓存的页面不应再次初始化OCR引擎")
+
+    monkeypatch.setattr("pdf_rescue_mcp.book_pipeline.create_ocr_adapter", fail_create_adapter)
+    resumed_engine, resumed_pages, resumed_failures, resumed_low = _extract_ocr_pages_resumable(
+        Path("书.pdf"),
+        cache_dir,
+        status_path,
+        target_pages=1,
+        resume=True,
+        dpi=220,
+    )
+
+    assert resumed_engine == "page_cache"
+    assert resumed_pages[0].text == pages[0].text
+    assert resumed_failures == []
+    assert resumed_low == []
 
 
 def test_already_retried_low_confidence_cache_is_not_retried(

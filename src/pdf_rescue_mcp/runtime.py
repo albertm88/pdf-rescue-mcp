@@ -12,6 +12,7 @@ import psutil
 from .models import GpuStatus, RuntimeProfile, RuntimeReadiness, ToolStatus
 from .ocr_engines import _quiet_native_output, prepare_paddle_gpu_dlls
 from .paths import ensure_runtime_layout
+from .resource_scheduler import ResourceScheduler, sample_process_cpu_usage
 
 
 def _decode_command_output(value: bytes | str | None) -> str:
@@ -46,8 +47,18 @@ def collect_process_resource_usage(pid: int | None) -> dict[str, object]:
             "状态": "不可用",
             "进程ID": None,
             "CPU占用率": None,
+            "CPU等效核心数": None,
+            "线程CPU占用率": None,
+            "线程采样窗口秒": None,
+            "进程线程数": None,
+            "活跃CPU线程数": None,
+            "饱和CPU线程数": None,
+            "线程CPU总和等效核心数": None,
+            "最大线程CPU占用率": None,
             "内存占用率": None,
             "内存MB": None,
+            "运行内存占用MB": None,
+            "运行内存占整机比例": None,
             "说明": "尚未取得工作进程PID。",
         }
     try:
@@ -57,30 +68,68 @@ def collect_process_resource_usage(pid: int | None) -> dict[str, object]:
                 "状态": "不可用",
                 "进程ID": int(pid),
                 "CPU占用率": None,
+                "CPU等效核心数": None,
+                "线程CPU占用率": None,
+                "线程采样窗口秒": None,
+                "进程线程数": None,
+                "活跃CPU线程数": None,
+                "饱和CPU线程数": None,
+                "线程CPU总和等效核心数": None,
+                "最大线程CPU占用率": None,
                 "内存占用率": None,
                 "内存MB": None,
+                "运行内存占用MB": None,
+                "运行内存占整机比例": None,
                 "说明": "工作进程已退出。",
             }
-        # 50ms是监控采样窗口，不会让MCP等待OCR；按工作进程而不是启动器采样。
-        cpu_percent = round(float(process.cpu_percent(interval=0.05)), 1)
+        # CPU占用率按整机逻辑CPU能力归一化；每个OS线程单独提供0–100%采样值。
+        cpu_sample = sample_process_cpu_usage(process)
+        thread_usage = cpu_sample.thread_cpu_percent or {}
+        thread_values = list(thread_usage.values())
         memory_info = process.memory_info()
         memory_percent = round(float(process.memory_percent()), 2)
         memory_mb = round(memory_info.rss / (1024 * 1024), 1)
+        try:
+            process_thread_count = max(0, int(process.num_threads()))
+        except (AttributeError, OSError, TypeError, ValueError, psutil.Error):
+            # A thread-count probe is observation-only.  Do not discard a valid
+            # CPU/RSS sample merely because a platform denies this one field.
+            process_thread_count = None
         return {
             "状态": "可用",
             "进程ID": int(pid),
-            "CPU占用率": cpu_percent,
+            "CPU占用率": cpu_sample.cpu_percent,
+            "CPU等效核心数": cpu_sample.cpu_core_equivalents,
+            "线程CPU占用率": cpu_sample.thread_cpu_percent,
+            "线程采样窗口秒": cpu_sample.sample_window_seconds,
+            "进程线程数": process_thread_count,
+            "活跃CPU线程数": sum(value >= 5.0 for value in thread_values),
+            "饱和CPU线程数": sum(value >= 80.0 for value in thread_values),
+            "线程CPU总和等效核心数": round(sum(thread_values) / 100.0, 2),
+            "最大线程CPU占用率": round(max(thread_values), 1) if thread_values else None,
             "内存占用率": memory_percent,
             "内存MB": memory_mb,
-            "说明": "按独立OCR工作进程采样；GPU占用需由GPU运行时单独提供。",
+            "运行内存占用MB": memory_mb,
+            "运行内存占整机比例": memory_percent,
+            "说明": "CPU占用率为该进程占整机逻辑CPU能力的比例；线程CPU占用率按线程ID分别显示，单线程不超过100%。",
         }
     except (OSError, ValueError, psutil.Error) as exc:
         return {
             "状态": "不可用",
             "进程ID": int(pid),
             "CPU占用率": None,
+            "CPU等效核心数": None,
+            "线程CPU占用率": None,
+            "线程采样窗口秒": None,
+            "进程线程数": None,
+            "活跃CPU线程数": None,
+            "饱和CPU线程数": None,
+            "线程CPU总和等效核心数": None,
+            "最大线程CPU占用率": None,
             "内存占用率": None,
             "内存MB": None,
+            "运行内存占用MB": None,
+            "运行内存占整机比例": None,
             "说明": f"工作进程资源采样失败：{type(exc).__name__}。",
         }
 
@@ -329,21 +378,22 @@ def doctor_runtime(deep_ocr_probe: bool = True) -> RuntimeProfile:
     readiness = _runtime_readiness()
     gpu = gpu_status.confirmed
 
+    worker_plan = ResourceScheduler().plan()
     if gpu and memory_gb >= 16:
         recommended_mode = "book-quality"
-        max_workers = 1
+        max_workers = worker_plan.target_workers
         max_dpi = 600
     elif memory_gb >= 16 and cpu_count >= 8:
         recommended_mode = "book-balanced"
-        max_workers = 1
+        max_workers = worker_plan.target_workers
         max_dpi = 500
     elif memory_gb >= 8:
         recommended_mode = "book-balanced-low-memory"
-        max_workers = 1
+        max_workers = worker_plan.target_workers
         max_dpi = 400
     else:
         recommended_mode = "book-fast-low-memory"
-        max_workers = 1
+        max_workers = worker_plan.target_workers
         max_dpi = 300
 
     tools = {
@@ -372,7 +422,10 @@ def doctor_runtime(deep_ocr_probe: bool = True) -> RuntimeProfile:
         notes.append(gpu_status.reason or "检测到显卡硬件，但图形处理器计算验证未通过，OCR将使用处理器。")
     elif gpu_status.hardware_available:
         notes.append("检测到显卡硬件；规划阶段未加载飞桨验证，实际提取会自动确认运行后端。")
-    notes.append("当前整书识别按页串行运行，建议同一设备一次只启动一本扫描书。")
+    notes.append(
+        "批量书籍worker会结合CPU线程、系统可用内存和每个worker的实时占用动态调度；"
+        f"当前规划上限为 {worker_plan.target_workers} 个。"
+    )
     if not tools["tesseract"].available:
         notes.append("未检测到备用OCR命令；可搜索PDF修复备用通道不可用。")
     if not tools["ocrmypdf"].available:

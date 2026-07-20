@@ -1,150 +1,84 @@
+"""启动百科全书书库的可恢复、资源感知批量任务。
+
+书本完成数和页数进度统一从 ``_BatchManager.status()`` 读取；完成判定必须
+覆盖源 PDF 总页数，旧的抽样状态不会被误计为完成。批量管理器会按 CPU、内存
+和每个 OCR worker 的实时占用动态决定并发数。
 """
-批量提取启动脚本：使用 _TaskManager 子进程架构连续处理所有书籍。
-保留书库的相对目录结构（01-主系列-已齐等）。
-"""
+
+from __future__ import annotations
+
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from pdf_rescue_mcp.server import _task_manager
-from pdf_rescue_mcp.library_pipeline import scan_pdf_library, _job_dir_for_pdf, _read_status
+from pdf_rescue_mcp.server import _batch_manager, _task_manager
 
 ROOT = r"D:\BaiduNetdiskDownload\dabao"
 OUTPUT = r"D:\农业百科全书-转文字"
-MODE = "book-fast"  # 快速模式，约 8-15 秒/页
+MODE = "book-fast"
 
 
-def _as_int(value: object) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _is_full_completion(status: dict | None, pdf_pages: int) -> bool:
-    """Only skip a book when its durable result covers the source PDF."""
-    if not status or status.get("状态") != "完成" or pdf_pages <= 0:
-        return False
-    target = _as_int(status.get("目标页数"))
-    processed = _as_int(status.get("已处理页数"))
-    total = _as_int(status.get("PDF总页数"))
-    return (
-        not bool(status.get("是否抽样"))
-        and target >= pdf_pages
-        and processed >= pdf_pages
-        and (not total or total >= pdf_pages)
-    )
-
-
-def main():
+def main() -> None:
     print("=== 中国农业百科全书批量提取 ===")
     print(f"根目录: {ROOT}")
     print(f"输出: {OUTPUT}")
     print(f"模式: {MODE}")
+    print("并发策略: 根据CPU线程、可用内存和每个worker实时占用动态调整")
     print()
-    
-    root_path = Path(ROOT)
-    output_path = Path(OUTPUT)
-    
-    # 扫描书库
-    print("正在扫描书库...")
-    scan = scan_pdf_library(ROOT, output_dir=OUTPUT, inspect_pages=3)
-    books = scan.get("书籍", [])
-    print(f"发现 {len(books)} 本书")
-    
-    # 过滤出需要 OCR 的 PDF（纯扫描 + 混合类型）
-    need_ocr = [
-        b for b in books 
-        if b.get("PDF类型") in ("纯扫描PDF", "混合PDF") 
-        or "OCR" in str(b.get("建议动作", ""))
-    ]
-    print(f"需要 OCR: {len(need_ocr)} 本")
-    print()
-    
-    # 逐本启动提取
-    for i, book in enumerate(need_ocr):
-        pdf_path = Path(book["PDF路径"])
-        book_name = book["文件名"].replace(".pdf", "")
-        total_pages = _as_int(book.get("总页数"))
 
-        if total_pages <= 0:
-            print(f"[{i+1}/{len(need_ocr)}] 跳过无法读取页数的PDF: {book_name}")
-            continue
-        
-        # 使用 library_pipeline 的逻辑计算正确的任务目录（保留相对路径）
-        job_dir = _job_dir_for_pdf(pdf_path, root_path, output_path)
-        
-        # 检查是否已完成
-        status = _read_status(job_dir)
-        if _is_full_completion(status, total_pages):
-            processed = _as_int(status.get("已处理页数"))
-            print(
-                f"[{i+1}/{len(need_ocr)}] 跳过已完成: "
-                f"{book_name} ({processed}/{total_pages} 页)"
-            )
-            continue
-
-        if status and status.get("状态") == "完成":
-            processed = _as_int(status.get("已处理页数"))
-            target = _as_int(status.get("目标页数"))
-            print(
-                f"  发现不完整的旧完成标记: {book_name} "
-                f"({processed}/{target or total_pages} 页)，将扩展到 {total_pages} 页"
-            )
-        
-        print(f"[{i+1}/{len(need_ocr)}] 启动: {book_name} ({total_pages} 页)")
-        print(f"  任务目录: {job_dir}")
-        
-        # start_extraction 会在 output_dir 下创建 *-rescue-result
-        # 所以传入 job_dir.parent，让它创建 job_dir.name（已经是 *-rescue-result）
-        actual_output_dir = job_dir.parent
-        returned_job_dir, already_running = _task_manager.start_extraction(
-            path=str(pdf_path),
-            output_dir=str(actual_output_dir),
+    # A controller restart must first reattach durable task supervision and the
+    # persisted batch.  Starting a fresh batch here would reset the book list
+    # and could compete with OCR workers that survived the old controller.
+    _task_manager.restore_pending()
+    _batch_manager.restore_pending()
+    if _batch_manager.status().get("运行中"):
+        started = {"状态": "已从持久状态恢复"}
+    else:
+        started = _batch_manager.start_batch(
+            root=ROOT,
+            output_dir=OUTPUT,
             mode=MODE,
-            max_pages=None,
+            max_books=None,
+            max_pages_per_book=None,
             resume=True,
-            password=None,
+            max_workers=None,
         )
-        
-        if already_running:
-            print("  已在运行")
-        else:
-            pid = _task_manager.get_task_info(returned_job_dir).get("进程ID")
-            print(f"  子进程 PID: {pid}")
-        
-        # 等待这本书完成（每 30 秒检查一次）
-        print("  处理中...", end="", flush=True)
-        last_progress = -1
-        while True:
-            time.sleep(30)
-            info = _task_manager.get_task_info(str(job_dir))
-            # 显示进度
-            status = _read_status(job_dir)
-            if status:
-                processed = _as_int(status.get("已处理页数"))
-                total = _as_int(status.get("目标页数")) or total_pages
-                if processed != last_progress:
-                    pct = round(processed / total * 100, 1) if total else 0
-                    print(f" {pct}%", end="", flush=True)
-                    last_progress = processed
-                if _is_full_completion(status, total_pages):
-                    print(f"\n  完成并核验: {processed}/{total_pages} 页")
-                    break
+    print(f"启动结果: {started}")
 
-            if not info or not info.get("存活"):
-                # 只有确认任务既没有活跃进程、又没有完成全页，才交给下一轮恢复。
-                state = status.get("状态", "未知") if status else "无状态文件"
-                processed = _as_int(status.get("已处理页数")) if status else 0
-                total = _as_int(status.get("目标页数")) if status else total_pages
-                print(f"\n  进程已结束但未完成: {state} {processed}/{total} 页")
-                break
-        
-        print()
-    
-    print("\n=== 所有书籍提取完成 ===")
+    while True:
+        status = _batch_manager.status()
+        completed = status.get("书本完成数", status.get("已完成", 0))
+        total = status.get("书本总数", status.get("总书数", 0))
+        current = status.get("书籍名") or status.get("当前书籍") or "无"
+        page_text = status.get("处理进度文本") or "未知"
+        worker_plan = status.get("worker调度") or {}
+        worker_summary = status.get("worker资源汇总") or {}
+        target_workers = worker_plan.get("target_workers", 1)
+        active_workers = worker_plan.get("active_workers", 0)
+        registered_workers = status.get("worker数", active_workers)
+        rss_mb = worker_summary.get("总运行内存占用MB")
+        process_threads = worker_summary.get("总进程线程数")
+        active_cpu_threads = worker_summary.get("总活跃CPU线程数")
+        cpu_percent = worker_summary.get("总CPU占整机比例")
+        resource_text = (
+            f"RSS: {rss_mb if rss_mb is not None else '未知'}MB | "
+            f"进程线程: {process_threads if process_threads is not None else '未知'} | "
+            f"活跃CPU线程: {active_cpu_threads if active_cpu_threads is not None else '未知'} | "
+            f"CPU: {cpu_percent if cpu_percent is not None else '未知'}%"
+        )
+        print(
+            f"书本进度: {completed}/{total} | 当前: {current} | "
+            f"页进度: {page_text} | worker: {registered_workers}/{target_workers} | {resource_text} | "
+            f"预计剩余: {status.get('剩余时间') or '未知'}",
+            flush=True,
+        )
+        if not status.get("运行中"):
+            print("=== 批量任务结束 ===")
+            print(f"完成: {completed}/{total} | 失败: {status.get('书本失败数', status.get('失败', 0))}")
+            break
+        time.sleep(30)
 
 
 if __name__ == "__main__":
