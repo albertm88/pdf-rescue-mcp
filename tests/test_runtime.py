@@ -100,6 +100,19 @@ def test_runtime_profile_keeps_hardware_and_ocr_gpu_separate(monkeypatch) -> Non
     assert profile.recommended_mode == "book-quality"
 
 
+def test_fast_runtime_profile_skips_blocking_external_probes(monkeypatch) -> None:
+    def external_probe_must_not_run(*_args, **_kwargs):
+        raise AssertionError("interactive planning must not run external probes")
+
+    monkeypatch.setattr(runtime, "_probe_nvidia_gpu", external_probe_must_not_run)
+    monkeypatch.setattr(runtime, "_command_status", external_probe_must_not_run)
+
+    profile = runtime.doctor_runtime(deep_ocr_probe=False, probe_external=False)
+
+    assert profile.gpu_available is False
+    assert all("快速规划未探测" in status.notes[0] for status in profile.tools.values())
+
+
 def test_runtime_readiness_reports_portability_risks(monkeypatch) -> None:
     monkeypatch.setattr(runtime.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(runtime.shutil, "which", lambda name: None)

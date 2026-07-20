@@ -65,8 +65,10 @@ def plan_pdf_job(
         inspection = inspect_pdf_text_layer(path, max_pages=20)
     else:
         inspection = inspect_pdf_text_layer(path, max_pages=20, password=password)
-    # 规划不应为了确认显卡后端而触发飞桨数十秒的冷启动。
-    runtime = doctor_runtime(deep_ocr_probe=False)
+    # Planning is part of the interactive MCP path.  Do not wait for a stalled
+    # driver or five external ``--version`` probes here; the monitoring layer
+    # performs the complete health check independently.
+    runtime = doctor_runtime(deep_ocr_probe=False, probe_external=False)
     mode = _normalize_quality(target_quality)
     dpi = _dpi_for(mode, runtime.max_dpi)
     direct_text = inspection.pdf_type == PdfType.BORN_DIGITAL_FULL_TEXT

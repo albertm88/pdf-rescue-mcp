@@ -179,3 +179,22 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# ---------------------------------------------------------------------------
+# 项目专属 (pdf-rescue-mcp)
+# ---------------------------------------------------------------------------
+
+# 运行时日志（批量任务、OCR、日期子目录）
+logs/
+
+# 运行时临时目录（OCR缓存、状态JSON、测试PDF/PNG、书库清单、诊断等）
+tmp/
+
+# 测试产生的临时监控目录（.pytest-final-monitoring-*、.pytest-tmp-* 等）
+.pytest-*/
+
+# 测试/调试用临时虚环境（.uv-controller-*、.uv-ocr-*、.uv-test-* 等）
+.uv-*/
+
+# 本地编辑器 MCP 配置（examples/ 里已有模板）
+.vscode/

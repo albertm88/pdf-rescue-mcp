@@ -45,3 +45,9 @@ def test_mcp_tool_contract_is_stable() -> None:
     primary = tools[0]
     assert primary.name == "rescue_pdf"
     assert {"path", "request"}.issubset(primary.inputSchema["properties"])
+    by_name = {tool.name: tool for tool in tools}
+    for name in ("get_job_status", "get_batch_status"):
+        annotations = by_name[name].annotations
+        assert annotations is not None
+        assert annotations.readOnlyHint is True
+        assert annotations.idempotentHint is True

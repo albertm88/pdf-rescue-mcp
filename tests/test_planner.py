@@ -23,10 +23,14 @@ def test_planning_uses_lightweight_runtime_probe(monkeypatch) -> None:
         recommended_action=RecommendedAction.FULL_BOOK_OCR,
         pages=[],
     )
-    calls: list[bool] = []
+    calls: list[tuple[bool, bool]] = []
 
-    def fake_runtime(*, deep_ocr_probe: bool = True) -> RuntimeProfile:
-        calls.append(deep_ocr_probe)
+    def fake_runtime(
+        *,
+        deep_ocr_probe: bool = True,
+        probe_external: bool = True,
+    ) -> RuntimeProfile:
+        calls.append((deep_ocr_probe, probe_external))
         return RuntimeProfile(
             platform="Windows",
             python="3.12",
@@ -52,7 +56,7 @@ def test_planning_uses_lightweight_runtime_probe(monkeypatch) -> None:
 
     result = planner.plan_pdf_job(Path("book.pdf"))
 
-    assert calls == [False]
+    assert calls == [(False, False)]
     assert inspected_pages == [20]
     assert result["engine"] == "paddleocr"
     assert result["dpi"] == 220

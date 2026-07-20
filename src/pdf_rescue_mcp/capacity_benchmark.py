@@ -213,7 +213,13 @@ class CapacityBenchmarkManager:
         memory = psutil.virtual_memory()
         available_memory_gb = memory.available / (1024**3)
         memory_worker_capacity = int(max(0.0, available_memory_gb - 2.0) // 2.0)
-        if memory_worker_capacity < 1:
+        # Production work always wins over an iteration benchmark.  Under a
+        # busy OCR run its memory footprint can make the instantaneous headroom
+        # look insufficient; returning "resources insufficient" first is
+        # misleading and nudges an agent toward needless diagnosis.  Preserve a
+        # deferred plan and re-check headroom when it is actually started.
+        active = find_live_ocr_processes()
+        if memory_worker_capacity < 1 and not active:
             return {
                 "状态": "资源不足",
                 "配置ID": None,
@@ -223,11 +229,12 @@ class CapacityBenchmarkManager:
                 "可用内存GB": round(available_memory_gb, 2),
                 "说明": "可用内存未超过 2GB 保留水位，未创建也不会启动容量基准。",
             }
-        worker_limit = max_workers or min(4, memory_worker_capacity)
+        planning_memory_capacity = max(1, memory_worker_capacity) if active else memory_worker_capacity
+        worker_limit = max_workers or min(4, planning_memory_capacity)
         candidates = build_capacity_candidates(
             logical_cpu_count=int(topology["logical_cpu_count"]),
             physical_cpu_count=int(topology["physical_cpu_count"]),
-            memory_worker_capacity=memory_worker_capacity,
+            memory_worker_capacity=planning_memory_capacity,
             max_workers=worker_limit,
             candidate_threads=candidate_threads,
         )
@@ -248,7 +255,6 @@ class CapacityBenchmarkManager:
             sample_pages=measured_pages,
             warmup_pages=warmup_count,
         )
-        active = find_live_ocr_processes()
         state = "已延期" if active else "可运行"
         self._store.update(profile["配置ID"], 状态=state, 活跃OCR进程=active)
         return {
@@ -290,6 +296,20 @@ class CapacityBenchmarkManager:
                     "配置ID": profile_id,
                     "活跃OCR进程": active,
                     "说明": "不会在任何生产OCR运行时启动基准测试。",
+                }
+            available_memory_gb = psutil.virtual_memory().available / (1024**3)
+            if available_memory_gb <= 2.0:
+                self._store.update(
+                    profile_id,
+                    状态="资源不足",
+                    活跃OCR进程=[],
+                    可用内存GB=round(available_memory_gb, 2),
+                )
+                return {
+                    "状态": "资源不足",
+                    "配置ID": profile_id,
+                    "可用内存GB": round(available_memory_gb, 2),
+                    "说明": "生产OCR已结束，但可用内存未超过 2GB 保留水位；不会启动基准任务。",
                 }
             self._cancel.clear()
             self._owned_pids.clear()

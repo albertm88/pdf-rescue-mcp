@@ -16,7 +16,7 @@ VS Code / TRAE / Codex / AnythingLLM / 其他 Host
 OCR/缓存/产物     任务账本/租约/治理  质量证据到建议计划
 ```
 
-任一 MCP 适配器都是短生命周期的无状态入口；实际 OCR 任务属于本机监管层，而不是某个对话、某个 IDE 或一次 MCP 请求。
+任一 MCP 适配器默认是短生命周期入口；当存在未完成批次时，监管层用本机 fencing lease 选出唯一的 **controller**。其余 VS Code、TRAE、Codex、AnythingLLM 或 HTTP 适配器都是 **observer**：只能读取同一份监管快照，不能因为一次查询而恢复 watcher、扫描书库、启动 worker 或改写账本。observer 按账本 mtime 只读刷新；只有原 controller 的 lease 失效后，后台 failover 线程才会竞争接管，接管成功后先恢复任务监管、再恢复批量调度。实际 OCR 任务属于本机监管层，而不是某个对话、某个 IDE 或一次 MCP 请求。
 
 ## 三层职责
 
@@ -28,17 +28,23 @@ OCR/缓存/产物     任务账本/租约/治理  质量证据到建议计划
 
 ## 非阻塞 OCR 生命周期
 
-1. MCP 工具规划路径；如果需要 OCR，则始终启动独立 worker，即使调用方传入 `foreground`。
-2. 监管层为“源文件指纹 + 输出根目录 + 模式 + 页范围”创建/复用本机任务，并取得 fencing lease。
-3. worker 获得不含密码的任务数据库路径和尝试 ID；密码只通过临时子进程环境传递。
-4. worker 在每页开始时记录“当前页”，在缓存、状态、低置信/失败记录完成原子提交后才记录“最后完成页”。
-5. 监管层每 5 秒检查两类信号：进程心跳与页级前进。心跳仍在但当前页超时同样被视为卡页。
-6. 卡死先写协作停止请求，等待页边界；超时后由 `psutil` 递归 `terminate → wait → kill`，再基于页缓存恢复一次。
-7. 终态或失败会结算尝试、释放精确 lease；恢复产生新的尝试号而不覆盖历史。
+1. MCP 工具只做有限的文本层规划；交互规划不执行 `nvidia-smi` 或外部工具版本探测。完整运行时体检由监管层/显式健康检查完成。
+2. 如果需要 OCR，则始终启动独立 worker，即使调用方传入 `foreground`。
+3. 已知没有 OCR 引擎时返回稳定的 `blocked / ocr_runtime_unavailable`，绝不创建必败 worker。
+4. 监管层为“源文件指纹 + 输出根目录 + 模式 + 页范围”创建/复用本机任务，并取得 fencing lease。
+5. worker 获得不含密码的任务数据库路径和尝试 ID；密码只通过临时子进程环境传递。
+6. worker 在每页开始时记录“当前页”，在缓存、状态、低置信/失败记录完成原子提交后才记录“最后完成页”。
+7. 监管层每 5 秒检查两类信号：进程心跳与页级前进。心跳仍在但当前页超时同样被视为卡页。
+8. 卡死先写协作停止请求，等待页边界；超时后由 `psutil` 递归 `terminate → wait → kill`，再基于页缓存恢复一次。
+9. 终态或失败会结算尝试、释放精确 lease；恢复产生新的尝试号而不覆盖历史。
 
 ## 批量书本计数与动态 worker
 
 `get_batch_status` 同时返回 `书本完成数`、`书本总数`、`书本失败数`、`书本待处理数` 和 `进行中书本数`，与当前书籍的页级进度分开统计，避免把“页完成”误报成“书完成”。只有实际处理页数覆盖源 PDF 页数时，书本才计入完成数。
+
+`batch_extract_library` / 目录形式的 `rescue_pdf` 先进入 `准备中`，由监管层后台发现书库后才转入 `运行中`；扫描不能占用 MCP 请求线程。批量账本拥有单独的 controller lease，controller 每轮续租；失去 lease 的进程立即停止 admission/恢复并降为 observer。observer 的 `stop_batch` 只写入停止命令，由 controller 在下一个监管周期执行，因此不会形成第二个写者。
+
+资源、RSS、逐线程 CPU、页速和 worker 调度计划都在 controller 的监管周期中采样并持久化为快照。状态工具（包括 observer）只读最近快照并带采样时间；频繁查询不会重新采样 worker、重新计算调度、修改页速基线或与调度锁竞争。
 
 批量调度由 `resource_scheduler.ResourceScheduler` 给出容量决策：
 
@@ -77,7 +83,9 @@ OCR/缓存/产物     任务账本/租约/治理  质量证据到建议计划
 
 - 默认传输为 stdio；支持 MCP 的 Host 可直接使用公开的 snake_case tool 名。
 - 可选 Streamable HTTP 只绑定回环地址；跨机器访问必须由带认证的网关负责。
-- 所有长任务返回 `job_dir`，随后通过 `get_job_status`、`resume_job`、`cancel_job`、`audit_job_quality` 和 `get_iteration_plan` 操作；不依赖实验性 MCP Tasks 能力。
+- 普通 Host 首选只调用 `rescue_pdf(path=<PDF或目录>, request=<用户原话>)`。返回中的机器字段 `contract_version` 和 `next_call` 使用固定英文键（`tool`、`arguments`、`read_only`），让任何 LLM/Host 无需解析中文展示文本或猜测后续工具。
+- `get_job_status` 与 `get_batch_status` 是显式只读 MCP 工具；它们返回业务、监管和资源快照，但不会启动/恢复 OCR。
+- 其余生命周期、容量和迭代工具保持兼容入口，供明确的管理员流程调用；不依赖实验性 MCP Tasks 能力。
 - `tools/list` 是发布契约。新增工具必须同步更新测试和客户端文档。
 
 ## 更新治理

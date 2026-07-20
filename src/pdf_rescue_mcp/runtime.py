@@ -356,11 +356,32 @@ def _runtime_readiness() -> RuntimeReadiness:
     )
 
 
-def doctor_runtime(deep_ocr_probe: bool = True) -> RuntimeProfile:
+def doctor_runtime(
+    deep_ocr_probe: bool = True,
+    *,
+    probe_external: bool = True,
+) -> RuntimeProfile:
+    """Build a runtime profile.
+
+    ``probe_external=False`` is the non-blocking planning path: it avoids
+    ``nvidia-smi`` and executable ``--version`` calls, each of which can hang
+    on a damaged driver or shell wrapper.  The explicit health-check tool keeps
+    the full probe by using the default value.
+    """
     cpu_count = os.cpu_count() or 1
     memory_gb = round(psutil.virtual_memory().total / (1024**3), 2)
-    hardware = _probe_nvidia_gpu()
-    paddle_gpu = _probe_paddle_gpu(hardware, deep_ocr_probe=deep_ocr_probe)
+    hardware = (
+        _probe_nvidia_gpu()
+        if probe_external
+        else {
+            "hardware_available": False,
+            "reason": "快速规划未执行外部图形处理器探测。",
+        }
+    )
+    paddle_gpu = _probe_paddle_gpu(
+        hardware,
+        deep_ocr_probe=deep_ocr_probe if probe_external else False,
+    )
     gpu_status = GpuStatus(
         hardware_available=bool(hardware.get("hardware_available"))
         or bool(paddle_gpu.get("confirmed")),
@@ -396,13 +417,19 @@ def doctor_runtime(deep_ocr_probe: bool = True) -> RuntimeProfile:
         max_workers = worker_plan.target_workers
         max_dpi = 300
 
-    tools = {
-        "tesseract": _command_status("tesseract", ["tesseract"], ["--version"]),
-        "ocrmypdf": _command_status("ocrmypdf", ["ocrmypdf"], ["--version"]),
-        "ghostscript": _command_status("ghostscript", ["gswin64c", "gswin32c", "gs"], ["--version"]),
-        "qpdf": _command_status("qpdf", ["qpdf"], ["--version"]),
-        "pdftoppm": _command_status("pdftoppm", ["pdftoppm"], ["-v"]),
-    }
+    if probe_external:
+        tools = {
+            "tesseract": _command_status("tesseract", ["tesseract"], ["--version"]),
+            "ocrmypdf": _command_status("ocrmypdf", ["ocrmypdf"], ["--version"]),
+            "ghostscript": _command_status("ghostscript", ["gswin64c", "gswin32c", "gs"], ["--version"]),
+            "qpdf": _command_status("qpdf", ["qpdf"], ["--version"]),
+            "pdftoppm": _command_status("pdftoppm", ["pdftoppm"], ["-v"]),
+        }
+    else:
+        tools = {
+            name: ToolStatus(name=name, available=False, notes=["快速规划未探测外部命令。"])
+            for name in ("tesseract", "ocrmypdf", "ghostscript", "qpdf", "pdftoppm")
+        }
     packages = {
         "fitz": _package_available("fitz"),
         "paddleocr": _package_available("paddleocr"),

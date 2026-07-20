@@ -2,16 +2,297 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pdf_rescue_mcp.server as server
 import pdf_rescue_mcp.paths as paths
+import pdf_rescue_mcp.library_pipeline as library_pipeline
+from pdf_rescue_mcp.supervisor import LocalSupervisor
 
 
 class FakeProcess:
     pid = 24680
+
+
+def _isolated_batch_manager(tmp_path: Path, owner_id: str) -> server._BatchManager:
+    manager = server._BatchManager(
+        controller_supervisor=LocalSupervisor(
+            database_path=tmp_path / "runtime" / "tasks.sqlite3",
+            owner_id=owner_id,
+        )
+    )
+    manager._state_path = tmp_path / "state" / "批量状态.json"
+    return manager
+
+
+def test_batch_start_returns_before_library_discovery_finishes(tmp_path: Path, monkeypatch) -> None:
+    manager = _isolated_batch_manager(tmp_path, "controller-one")
+    discovery_started = threading.Event()
+    release_discovery = threading.Event()
+
+    def blocking_scan(*_args, **_kwargs):
+        discovery_started.set()
+        assert release_discovery.wait(5)
+        return {"书籍": []}
+
+    monkeypatch.setattr(library_pipeline, "scan_pdf_library", blocking_scan)
+
+    started_at = time.monotonic()
+    result = manager.start_batch(
+        root=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+        mode="book-fast",
+        max_books=None,
+        max_pages_per_book=None,
+        resume=True,
+    )
+
+    assert time.monotonic() - started_at < 0.5
+    assert result["状态"] == "准备中"
+    assert discovery_started.wait(2)
+    assert manager.status()["批处理阶段"] == "准备中"
+
+    release_discovery.set()
+    assert manager._thread is not None
+    manager._thread.join(5)
+    assert manager.status()["批处理阶段"] == "已完成"
+
+
+def test_second_batch_adapter_observes_without_starting_a_competing_controller(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    first = _isolated_batch_manager(tmp_path, "controller-one")
+    second = _isolated_batch_manager(tmp_path, "controller-two")
+    discovery_started = threading.Event()
+    release_discovery = threading.Event()
+
+    def blocking_scan(*_args, **_kwargs):
+        discovery_started.set()
+        assert release_discovery.wait(5)
+        return {"书籍": []}
+
+    monkeypatch.setattr(library_pipeline, "scan_pdf_library", blocking_scan)
+    first.start_batch(
+        root=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+        mode="book-fast",
+        max_books=None,
+        max_pages_per_book=None,
+        resume=True,
+    )
+    assert discovery_started.wait(2)
+
+    second.restore_pending()
+
+    observed = second.status()
+    assert second._thread is None
+    assert observed["控制器角色"] == "观察者"
+    assert observed["代理动作"]["requires_agent_action"] is False
+
+    release_discovery.set()
+    assert first._thread is not None
+    first._thread.join(5)
+
+
+def test_batch_observer_refreshes_the_controller_snapshot_without_becoming_a_scheduler(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    first = _isolated_batch_manager(tmp_path, "controller-one")
+    second = _isolated_batch_manager(tmp_path, "controller-two")
+    book_a = {"文件名": "book-a.pdf", "PDF路径": str(tmp_path / "book-a.pdf")}
+    book_b = {"文件名": "book-b.pdf", "PDF路径": str(tmp_path / "book-b.pdf")}
+
+    with first._lock:
+        assert first._acquire_controller_lease_locked()
+        first._running = True
+        first._phase = "运行中"
+        first._root = str(tmp_path)
+        first._output_dir = str(tmp_path / "out")
+        first._books = [book_a]
+        first._completed = ["book-a"]
+        first._save_state()
+
+    second.restore_pending()
+    monkeypatch.setattr(
+        server,
+        "collect_process_resource_usage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("status must not sample")),
+    )
+    monkeypatch.setattr(
+        server.ResourceScheduler,
+        "plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("status must not plan")),
+    )
+    initial = second.status()
+    assert second._thread is None
+    assert initial["控制器角色"] == "观察者"
+    assert initial["控制器所有者"] == "controller-one"
+    assert initial["书本完成数"] == 1
+
+    # The observer receives the new atomic snapshot, but never takes the
+    # controller lease or writes a competing batch ledger.
+    time.sleep(0.01)
+    with first._lock:
+        first._books.append(book_b)
+        first._completed.append("book-b")
+        first._save_state()
+    persisted_after_controller_write = first._state_path.read_text(encoding="utf-8")
+
+    refreshed = second.status()
+    assert refreshed["书本总数"] == 2
+    assert refreshed["书本完成数"] == 2
+    assert second._controller_lease is None
+    assert second._thread is None
+    assert first._state_path.read_text(encoding="utf-8") == persisted_after_controller_write
+
+    with first._lock:
+        first._release_controller_lease_locked()
+
+
+def test_batch_observer_promotes_after_controller_lease_is_released(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    first = _isolated_batch_manager(tmp_path, "controller-one")
+    promoted: list[str] = []
+    second = server._BatchManager(
+        controller_supervisor=LocalSupervisor(
+            database_path=tmp_path / "runtime" / "tasks.sqlite3",
+            owner_id="controller-two",
+        ),
+        on_observer_promoted=lambda: promoted.append("promoted"),
+    )
+    second._state_path = first._state_path
+    second.OBSERVER_TAKEOVER_INTERVAL = 0.01
+    discovery_started = threading.Event()
+    release_discovery = threading.Event()
+
+    def blocking_scan(*_args, **_kwargs):
+        discovery_started.set()
+        assert release_discovery.wait(3)
+        return {"书籍": []}
+
+    monkeypatch.setattr(library_pipeline, "scan_pdf_library", blocking_scan)
+    with first._lock:
+        assert first._acquire_controller_lease_locked()
+        first._running = True
+        first._phase = "准备中"
+        first._root = str(tmp_path)
+        first._output_dir = str(tmp_path / "out")
+        first._save_state()
+
+    second.restore_pending()
+    assert second._observer_only is True
+    assert second._observer_takeover_thread is not None
+
+    with first._lock:
+        first._release_controller_lease_locked()
+
+    assert discovery_started.wait(2)
+    assert promoted == ["promoted"]
+    assert second._observer_only is False
+    assert second._controller_lease is not None
+
+    release_discovery.set()
+    assert second._thread is not None
+    second._thread.join(3)
+
+
+def test_batch_restore_with_unavailable_lease_backend_stays_read_only_observer(
+    tmp_path: Path,
+) -> None:
+    first = _isolated_batch_manager(tmp_path, "controller-one")
+
+    class UnavailableLeaseSupervisor:
+        owner_id = "unavailable-controller"
+        CONTROLLER_LEASE_SECONDS = 45
+
+        def acquire_controller_lease(self, _resource_key: str):
+            raise sqlite3.OperationalError("lease database unavailable")
+
+    with first._lock:
+        assert first._acquire_controller_lease_locked()
+        first._running = True
+        first._phase = "运行中"
+        first._root = str(tmp_path)
+        first._output_dir = str(tmp_path / "out")
+        first._books = [{"文件名": "book-a.pdf", "PDF路径": str(tmp_path / "book-a.pdf")}]
+        first._save_state()
+
+    second = server._BatchManager(controller_supervisor=UnavailableLeaseSupervisor())
+    second._state_path = first._state_path
+    try:
+        second.restore_pending()
+        observed = second.status()
+
+        assert second._observer_only is True
+        assert second._controller_lease is None
+        assert second._thread is None
+        assert observed["控制器角色"] == "观察者"
+        assert observed["控制器所有者"] == "controller-one"
+        assert observed["控制器租约状态"] == "观察中，后台重试"
+        assert observed["控制器租约错误"].startswith("OperationalError:")
+        assert observed["代理动作"]["requires_agent_action"] is False
+    finally:
+        second._observer_takeover_stop.set()
+        with first._lock:
+            first._release_controller_lease_locked()
+
+
+def test_batch_state_write_is_rejected_after_controller_fencing_is_lost(tmp_path: Path) -> None:
+    first = _isolated_batch_manager(tmp_path, "controller-one")
+    second = _isolated_batch_manager(tmp_path, "controller-two")
+    with first._lock:
+        assert first._acquire_controller_lease_locked()
+        first._running = True
+        first._root = str(tmp_path)
+        first._output_dir = str(tmp_path / "out")
+        first._completed = ["first-snapshot"]
+        first._save_state()
+        stale_lease = first._controller_lease
+
+    assert stale_lease is not None
+    assert first._get_controller_supervisor().release_controller_lease(stale_lease)
+    with second._lock:
+        assert second._acquire_controller_lease_locked()
+        second._running = True
+        second._root = str(tmp_path)
+        second._output_dir = str(tmp_path / "out")
+        second._completed = ["new-controller-snapshot"]
+        second._save_state()
+
+    with first._lock:
+        first._completed = ["stale-controller-write"]
+        first._save_state()
+        assert first._observer_only is True
+
+    persisted = json.loads(first._state_path.read_text(encoding="utf-8"))
+    assert persisted["已完成"] == ["new-controller-snapshot"]
+    first._observer_takeover_stop.set()
+    with second._lock:
+        second._release_controller_lease_locked()
+
+
+def test_resume_cache_replay_is_not_reported_as_live_ocr_throughput() -> None:
+    assert server._looks_like_resume_cache_replay(153.0, 14.0) is True
+    assert server._looks_like_resume_cache_replay(1.0, 55.0) is False
+    assert server._looks_like_resume_cache_replay(8.0, 180.0) is False
+
+
+def test_failed_book_is_removed_from_completed_ledger() -> None:
+    manager = server._BatchManager()
+    manager._completed = ["已完成书", "需纠正书"]
+
+    manager._record_book_failure("需纠正书", "未完成（0/100页）")
+
+    assert manager._completed == ["已完成书"]
+    assert manager._failed == [{"书名": "需纠正书", "原因": "未完成（0/100页）"}]
 
 
 def test_restored_batch_continues_after_existing_active_workers() -> None:
@@ -75,8 +356,21 @@ def test_batch_restarts_cancelled_active_job_before_admitting_new_book(
         "max_pages": None,
         "resume": True,
         "password": None,
-        "ocr_threads": 4,
+        "ocr_threads": 2,
     }]
+
+
+def test_resumed_worker_keeps_high_thread_budget_only_for_active_profile(monkeypatch) -> None:
+    manager = server._BatchManager()
+    record = {"线程预算": 4}
+    monkeypatch.setattr(
+        manager._throughput_profiles,
+        "active_recommendation",
+        lambda *, mode: {"threads_per_worker": 4},
+    )
+
+    assert manager._resume_thread_budget(record) == 4
+    assert record["线程预算"] == 4
 
 
 def test_get_job_status_exposes_metrics_and_worker_resources(tmp_path: Path, monkeypatch) -> None:
@@ -189,6 +483,7 @@ def test_batch_status_exposes_current_book_metrics(tmp_path: Path, monkeypatch) 
         },
     )
 
+    manager._refresh_worker_supervision(list(manager._active_jobs.values()))
     result = manager.status()
 
     assert result["书籍名"] == "书"
@@ -215,6 +510,229 @@ def test_batch_status_exposes_current_book_metrics(tmp_path: Path, monkeypatch) 
     assert result["worker资源汇总"]["总饱和CPU线程数"] == 2
     assert result["worker资源汇总"]["总运行内存占用MB"] == 512.0
     assert result["worker资源汇总"]["采样完整"] is True
+
+
+def test_batch_status_reports_actual_per_worker_page_rate(tmp_path: Path, monkeypatch) -> None:
+    job_dir = tmp_path / "输出" / "农业化学卷-rescue-result"
+    job_dir.mkdir(parents=True)
+    status_path = job_dir / "状态.json"
+
+    def write_status(processed: int) -> None:
+        status_path.write_text(
+            json.dumps(
+                {
+                    "状态": "进行中",
+                    "来源PDF": str(tmp_path / "农业化学卷.pdf"),
+                    "目标页数": 100,
+                    "已处理页数": processed,
+                    "开始时间": "2026-07-20T09:00:00",
+                    "已耗时秒": 600,
+                    "平均每页秒": 120.0,
+                    "预计剩余秒": 9000,
+                    "短窗OCR页每分钟": 3.0,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    write_status(5)
+    heartbeat = {"completed": 5, "at": "2026-07-20T10:00:00"}
+
+    class FakeTaskManager:
+        def get_task_info(self, _job_dir: str) -> dict:
+            return {
+                "存活": True,
+                "工作进程ID": 97531,
+                "启动进程ID": 24680,
+                "心跳": {
+                    "存在": True,
+                    "活跃": True,
+                    "进程ID": 97531,
+                    "最后完成页": heartbeat["completed"],
+                    "最后进度时间": heartbeat["at"],
+                },
+            }
+
+    manager = server._BatchManager()
+    manager._books = [{"文件名": "农业化学卷.pdf", "PDF路径": str(tmp_path / "农业化学卷.pdf")}]
+    manager._current_index = 0
+    manager._current_job_dir = str(job_dir)
+    manager._active_jobs = {
+        str(job_dir): {
+            "索引": 0,
+            "书名": "农业化学卷",
+            "任务目录": str(job_dir),
+            "来源PDF": str(tmp_path / "农业化学卷.pdf"),
+            "线程预算": 4,
+        }
+    }
+    monkeypatch.setattr(server, "_task_manager", FakeTaskManager())
+    monkeypatch.setattr(
+        server,
+        "collect_process_resource_usage",
+        lambda pid: {
+            "状态": "可用",
+            "进程ID": pid,
+            "CPU占用率": 51.9,
+            "CPU等效核心数": 8.31,
+            "线程CPU占用率": {"10": 100.0},
+            "进程线程数": 27,
+            "活跃CPU线程数": 2,
+            "饱和CPU线程数": 1,
+            "内存MB": 512.0,
+            "内存占用率": 3.5,
+            "运行内存占用MB": 512.0,
+            "运行内存占整机比例": 3.5,
+        },
+    )
+
+    manager._refresh_worker_supervision(list(manager._active_jobs.values()))
+    first = manager.status()
+    assert first["worker资源"][0]["近期实际速度状态"] == "采样中"
+
+    write_status(7)
+    heartbeat.update({"completed": 7, "at": "2026-07-20T10:02:00"})
+    manager._refresh_worker_supervision(list(manager._active_jobs.values()))
+    second = manager.status()
+    worker = second["worker资源"][0]
+
+    assert worker["近期实际处理页每分钟"] == 1.0
+    assert worker["近期实际处理秒每页"] == 60.0
+    assert worker["处理速度"].startswith("1.000页/分钟")
+    assert worker["OCR吞吐页每分钟"] == 3.0
+    assert worker["实际Worker PID"] == 97531
+    assert worker["实际Worker PID"] != 24680
+    assert worker["OCR线程预算"] == 4
+    assert worker["进程线程数"] == 27
+    assert worker["CPU整机占比"] == 51.9
+    assert worker["CPU等效核心"] == 8.31
+    assert worker["RSS内存MB"] == 512.0
+
+    samples_before = dict(manager._worker_progress_samples)
+    supervision_before = dict(manager._worker_supervision)
+    writes: list[object] = []
+    monkeypatch.setattr(
+        server,
+        "collect_process_resource_usage",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("status must use the supervision cache")),
+    )
+    monkeypatch.setattr(
+        server._TaskManager,
+        "_atomic_json",
+        lambda *_args, **_kwargs: writes.append("write"),
+    )
+
+    cached = manager.status()
+
+    assert cached["worker资源"][0]["近期实际处理页每分钟"] == 1.0
+    assert manager._worker_progress_samples == samples_before
+    assert manager._worker_supervision == supervision_before
+    assert writes == []
+    fixed = second["固定监测格式"]
+    assert fixed["当前worker任务列表"][0]["标记"] == "-"
+    assert fixed["实际Worker PID"] == [97531]
+    assert fixed["CPU整机占比"] == 51.9
+    assert fixed["RSS内存"] == 512.0
+
+
+def test_batch_status_task_markers_and_remaining_book_count(tmp_path: Path, monkeypatch) -> None:
+    books = ["已完成书", "运行书A", "运行书B", "失败书", "待处理书"]
+    job_dirs: dict[str, Path] = {}
+    for book_name in ("运行书A", "运行书B"):
+        job_dir = tmp_path / f"{book_name}-rescue-result"
+        job_dir.mkdir()
+        (job_dir / "状态.json").write_text(
+            json.dumps(
+                {
+                    "状态": "进行中",
+                    "来源PDF": str(tmp_path / f"{book_name}.pdf"),
+                    "目标页数": 20,
+                    "已处理页数": 5,
+                    "开始时间": "2026-07-20T10:00:00",
+                    "更新时间": "2026-07-20T10:01:00",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        job_dirs[book_name] = job_dir
+
+    class FakeTaskManager:
+        def get_task_info(self, job_dir: str) -> dict:
+            pid = 1001 if "运行书A" in job_dir else 1002
+            return {
+                "存活": True,
+                "工作进程ID": pid,
+                "心跳": {
+                    "存在": True,
+                    "活跃": True,
+                    "进程ID": pid,
+                    "最后完成页": 5,
+                    "最后进度时间": "2026-07-20T10:01:00",
+                },
+            }
+
+    manager = server._BatchManager()
+    manager._books = [
+        {"文件名": f"{book_name}.pdf", "PDF路径": str(tmp_path / f"{book_name}.pdf")}
+        for book_name in books
+    ]
+    manager._completed = ["已完成书"]
+    manager._failed = [{"书名": "失败书", "原因": "测试失败"}]
+    manager._active_jobs = {
+        str(job_dirs["运行书A"]): {
+            "索引": 1,
+            "书名": "运行书A",
+            "任务目录": str(job_dirs["运行书A"]),
+            "线程预算": 2,
+        },
+        str(job_dirs["运行书B"]): {
+            "索引": 2,
+            "书名": "运行书B",
+            "任务目录": str(job_dirs["运行书B"]),
+            "线程预算": 3,
+        },
+    }
+    monkeypatch.setattr(server, "_task_manager", FakeTaskManager())
+    monkeypatch.setattr(
+        server,
+        "collect_process_resource_usage",
+        lambda pid: {
+            "状态": "可用",
+            "进程ID": pid,
+            "CPU占用率": 10.0,
+            "CPU等效核心数": 1.6,
+            "线程CPU占用率": {},
+            "进程线程数": 12,
+            "活跃CPU线程数": 1,
+            "饱和CPU线程数": 0,
+            "内存MB": 256.0,
+            "内存占用率": 1.5,
+            "运行内存占用MB": 256.0,
+            "运行内存占整机比例": 1.5,
+        },
+    )
+
+    manager._refresh_worker_supervision(list(manager._active_jobs.values()))
+    result = manager.status()
+    markers = {item["书籍"]: item["标记"] for item in result["当前worker任务列表"]}
+
+    assert result["书本完成数"] == 1
+    assert result["书本失败数"] == 1
+    assert result["书本待处理数"] == 1
+    assert result["进行中书本数"] == 2
+    assert result["剩余书本数量"] == 3
+    assert markers == {
+        "已完成书": "v",
+        "运行书A": "-",
+        "运行书B": "-",
+        "失败书": "x",
+        "待处理书": "○",
+    }
+    completed = next(item for item in result["当前worker任务列表"] if item["书籍"] == "已完成书")
+    assert completed["实际Worker PID"] is None
+    assert completed["RSS内存MB"] is None
 
 
 def test_worker_resource_summary_preserves_missing_worker_samples() -> None:
@@ -394,6 +912,98 @@ def test_background_task_is_live_during_startup_grace_before_first_heartbeat(
     assert health and health["存活"] is True
     assert health["心跳"]["活跃"] is False
     assert health["监控阶段"] == "启动中"
+    manager._stopping = True
+
+
+def test_live_heartbeat_without_first_page_is_recovered_after_startup_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(paths, "PROJECT_ROOT", tmp_path)
+    manager = server._TaskManager()
+    job_dir = tmp_path / "输出" / "启动卡死书-rescue-result"
+    job_dir.mkdir(parents=True)
+    status_path = job_dir / "状态.json"
+    heartbeat_path = job_dir / "后台任务心跳.json"
+    cancel_path = job_dir / "停止请求.json"
+    status_path.write_text('{"状态":"启动中"}', encoding="utf-8")
+    heartbeat_path.write_text(
+        json.dumps(
+            {
+                "状态": "运行中",
+                "进程ID": 97531,
+                "当前页": None,
+                "最后完成页": None,
+                "最后进度时间": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    info = {
+        "job_dir": str(job_dir),
+        "source": str(tmp_path / "启动卡死书.pdf"),
+        "started_at": time.time() - manager.STARTUP_PROGRESS_TIMEOUT - 1,
+        "phase": "启动中",
+        "heartbeat_path": str(heartbeat_path),
+        "cancel_path": str(cancel_path),
+        "metadata_path": str(job_dir / "后台任务.json"),
+        "launcher_pid": None,
+        "worker_pid": None,
+        "process": None,
+    }
+    recovered: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        manager,
+        "_recover_stalled_locked",
+        lambda _job_key, _info, heartbeat: recovered.append(heartbeat),
+    )
+
+    manager._watch_task_locked(str(job_dir), info)
+
+    assert len(recovered) == 1
+    assert recovered[0]["当前页"] is None
+    assert recovered[0]["最后完成页"] is None
+    manager._stopping = True
+
+
+def test_new_worker_attempt_clears_stale_missing_engine_status(tmp_path: Path, monkeypatch) -> None:
+    """A good retry must not report an old runtime failure during warm-up."""
+
+    monkeypatch.setattr(paths, "PROJECT_ROOT", tmp_path)
+    manager = server._TaskManager()
+    source = tmp_path / "扫描书.pdf"
+    source.write_bytes(b"not inspected by the launcher")
+    result_dir = tmp_path / "输出" / "扫描书-rescue-result"
+    result_dir.mkdir(parents=True)
+    (result_dir / "状态.json").write_text(
+        json.dumps(
+            {
+                "状态": "未完成",
+                "引擎": "无可用OCR引擎",
+                "失败原因": "previous runtime missing",
+                "失败时间": "2026-07-20T13:00:00",
+                "已处理页数": 12,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+
+    job_dir, already_running = manager.start_extraction(
+        str(source),
+        output_dir=str(tmp_path / "输出"),
+        mode="book-fast",
+        max_pages=None,
+        resume=True,
+        password=None,
+    )
+
+    status = json.loads((Path(job_dir) / "状态.json").read_text(encoding="utf-8"))
+    assert already_running is False
+    assert status["状态"] == "启动中"
+    assert status["引擎"] == "待worker确认"
+    assert status["已处理页数"] == 12
+    assert "失败原因" not in status
+    assert "失败时间" not in status
     manager._stopping = True
 
 
@@ -714,6 +1324,47 @@ def test_durable_supervisor_passes_only_non_secret_worker_identity(tmp_path: Pat
     manager._stopping = True
 
 
+def test_restored_monitor_retries_after_old_task_lease_expires(tmp_path: Path, monkeypatch) -> None:
+    """A controller restart must eventually regain supervision without touching OCR."""
+    monkeypatch.setenv("PDF_RESCUE_RUNTIME_ROOT", str(tmp_path / "runtime-layout"))
+    database_path = tmp_path / "runtime" / "tasks.sqlite3"
+    source = tmp_path / "扫描书.pdf"
+    source.write_bytes(b"not inspected by the launcher")
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+
+    first_supervisor = LocalSupervisor(database_path=database_path, owner_id="old-owner")
+    first = server._TaskManager(enable_durable_supervision=True, supervisor=first_supervisor)
+    job_dir, already_running = first.start_extraction(
+        str(source),
+        output_dir=str(tmp_path / "输出"),
+        mode="book-fast",
+        max_pages=None,
+        resume=True,
+        password=None,
+    )
+    assert already_running is False
+
+    second_supervisor = LocalSupervisor(database_path=database_path, owner_id="new-owner")
+    second = server._TaskManager(enable_durable_supervision=True, supervisor=second_supervisor)
+    second.restore_pending()
+    assert job_dir not in second._tasks
+    assert job_dir in second._pending_restores
+
+    old_context = first._tasks[job_dir]["supervision_context"]
+    assert first_supervisor.store.release_lease(
+        old_context.lease.resource_key,
+        owner_id=first_supervisor.owner_id,
+        token=old_context.lease.token,
+    )
+    with second._lock:
+        second._try_reattach_pending_locked()
+
+    assert job_dir in second._tasks
+    assert job_dir not in second._pending_restores
+    first._stopping = True
+    second._stopping = True
+
+
 def _plan(route: str, estimated_seconds: int = 5) -> dict[str, object]:
     return {
         "route": route,
@@ -772,6 +1423,26 @@ def test_primary_tool_starts_long_ocr_in_background(monkeypatch) -> None:
     assert launches == [{"output_dir": None, "mode": "book-balanced", "max_pages": None, "resume": True, "password": None}]
 
 
+def test_primary_tool_does_not_launch_a_known_unavailable_ocr_runtime(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server,
+        "run_plan_pdf_job",
+        lambda *_args, **_kwargs: {**_plan("ocr_required", 0), "engine": "none"},
+    )
+
+    class FakeTaskManager:
+        def start_extraction(self, *_args, **_kwargs):
+            raise AssertionError("a known unavailable OCR runtime must not create a worker")
+
+    monkeypatch.setattr(server, "_task_manager", FakeTaskManager())
+
+    result = asyncio.run(server.rescue_pdf(path="D:/books/scan.pdf", request="extract this scan"))
+
+    assert result["状态"] == "OCR运行环境不可用"
+    assert result["结果"]["error_code"] == "ocr_runtime_unavailable"
+    assert result["结果"]["requires_user_action"] is True
+
+
 def test_primary_tool_never_runs_ocr_in_foreground_even_when_requested(monkeypatch) -> None:
     monkeypatch.setattr(server, "run_plan_pdf_job", lambda *args, **kwargs: _plan("ocr_required", 1))
     launches: list[dict[str, object]] = []
@@ -797,6 +1468,48 @@ def test_primary_tool_never_runs_ocr_in_foreground_even_when_requested(monkeypat
 
     assert result["状态"] == "已启动后台救援任务"
     assert len(launches) == 1
+
+
+def test_primary_tool_accepts_english_lifecycle_intent() -> None:
+    assert server._infer_workflow("auto", "resume the task", None, "D:/out/job", None) == "resume"
+    assert server._infer_workflow("auto", "show page 5", None, "D:/out/job", None) == "evidence"
+    assert server._infer_workflow("auto", "audit quality", None, "D:/out/job", None) == "audit"
+    assert server._infer_workflow(
+        "auto", "check whether this PDF needs OCR", "D:/books/scan.pdf", None, None
+    ) == "diagnose"
+
+
+def test_primary_tool_starts_directory_as_a_background_batch(tmp_path: Path, monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeBatchManager:
+        def start_batch(self, **kwargs):
+            calls.append(kwargs)
+            return {"状态": "准备中"}
+
+    monkeypatch.setattr(server, "_batch_manager", FakeBatchManager())
+    monkeypatch.setattr(
+        server,
+        "run_plan_pdf_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("directory must not synchronously plan a PDF")),
+    )
+
+    result = asyncio.run(server.rescue_pdf(path=str(tmp_path), request="extract all PDFs"))
+
+    assert result["状态"] == "已提交批量后台任务"
+    assert calls == [{
+        "root": str(tmp_path),
+        "output_dir": None,
+        "mode": "book-balanced",
+        "max_books": None,
+        "max_pages_per_book": None,
+        "resume": True,
+    }]
+    assert result["next_call"] == {
+        "tool": "rescue_pdf",
+        "arguments": {"path": str(tmp_path), "workflow": "status"},
+        "read_only": True,
+    }
 
 
 def test_iteration_tool_combines_business_quality_and_supervision_evidence(monkeypatch) -> None:
@@ -958,16 +1671,22 @@ def test_primary_tool_resume_reuses_background_task_manager(monkeypatch) -> None
 
 
 def test_primary_tool_routes_existing_job_to_status(monkeypatch) -> None:
+    calls: list[str] = []
     monkeypatch.setattr(
         server,
-        "run_read_job_status",
-        lambda job_dir: {"status": {"status": "running"}, "job_dir": job_dir},
+        "get_job_status",
+        lambda job_dir: (
+            calls.append(job_dir)
+            or {"工作进程健康": {"工作进程ID": 12345}, "任务目录": job_dir}
+        ),
     )
 
     result = asyncio.run(server.rescue_pdf(job_dir="D:/out/book-rescue-result", request="现在处理进度怎么样"))
 
     assert result["状态"] == "已读取任务状态"
     assert result["已执行"] == ["查看任务状态"]
+    assert calls == ["D:/out/book-rescue-result"]
+    assert result["结果"]["工作进程健康"]["工作进程ID"] == 12345
 
 
 def test_primary_tool_diagnoses_before_extracting_when_user_only_asks_about_ocr(monkeypatch) -> None:

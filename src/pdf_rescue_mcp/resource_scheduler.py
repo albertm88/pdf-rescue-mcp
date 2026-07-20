@@ -43,6 +43,7 @@ def worker_threads_for_pages(
     *,
     capacity_threads: int,
     available_thread_slots: int | None = None,
+    allow_high_thread_budget: bool = False,
 ) -> int:
     """Choose a 1–4 thread budget for a *new* worker.
 
@@ -54,12 +55,18 @@ def worker_threads_for_pages(
         pages = max(0, int(page_count or 0))
     except (TypeError, ValueError):
         pages = 0
-    if pages >= 400:
-        page_budget = 4
-    elif pages >= 200:
-        page_budget = 3
-    elif pages >= 80:
+    # Page count alone does not justify extra OCR threads.  On the current
+    # 16-logical-thread host, measured 2-thread throughput is equivalent to
+    # 4-thread throughput, so keep every normal worker at <=2 threads.  An
+    # explicitly activated, hardware-matched throughput profile may opt into
+    # the old 3/4-thread page bands.
+    if pages >= 80:
         page_budget = 2
+        if allow_high_thread_budget:
+            if pages >= 400:
+                page_budget = 4
+            elif pages >= 200:
+                page_budget = 3
     else:
         page_budget = 1
 
@@ -194,6 +201,8 @@ class WorkerPlan:
     used_saturated_threads: int = 0
     used_thread_slots: int = 0
     available_thread_slots: int = 0
+    worker_available_thread_slots: int = 0
+    system_available_thread_slots: int | None = None
     additional_memory_slots: int = 0
     external_cpu_percent: float | None = None
     throughput_pages_per_minute: float | None = None
@@ -374,7 +383,28 @@ class ResourceScheduler:
             for worker in workers
         )
         reserve_logical = min(max(0, cpu_count - 1), self.reserve_threads)
-        available_thread_slots = max(0, cpu_count - reserve_logical - used_thread_slots)
+        worker_available_thread_slots = max(0, cpu_count - reserve_logical - used_thread_slots)
+
+        # A worker's thread budget is not the entire machine load: it tells us
+        # how much OCR capacity is already reserved, while the system sample
+        # tells us how much capacity is actually left for *all* processes.
+        # Both constraints must leave room for a new worker.  In particular,
+        # do not turn ``external_cpu_percent >= 25`` into a permanent veto:
+        # on a 16-thread host, a 60% system load still has four usable logical
+        # threads after the two system-reserve threads are protected.
+        system_available_thread_slots: int | None = None
+        if system_cpu is not None:
+            busy_logical_threads = cpu_count * system_cpu / 100.0
+            system_available_thread_slots = max(
+                0,
+                int(math.floor(cpu_count - reserve_logical - busy_logical_threads)),
+            )
+        available_thread_slots = min(
+            worker_available_thread_slots,
+            system_available_thread_slots
+            if system_available_thread_slots is not None
+            else worker_available_thread_slots,
+        )
         additional_by_thread = available_thread_slots // requested_threads
         thread_target = max(active_workers, active_workers + additional_by_thread)
         target = max(active_workers, min(hard_limit, requested_workers, max(1, thread_target)))
@@ -390,24 +420,27 @@ class ResourceScheduler:
         if system_cpu is not None:
             system_cores = system_cpu / 100.0 * cpu_count
             external_cpu_percent = round(max(0.0, system_cores - worker_cores) / cpu_count * 100.0, 1)
-        # Whole-machine CPU is a guardrail for non-OCR external load.  It does
-        # not by itself determine the worker allocation.
-        if external_cpu_percent is not None and external_cpu_percent >= 25.0:
+        # Whole-machine CPU is a guardrail, but it is combined with the live
+        # OCR-thread reservation above instead of being a fixed external-load
+        # cutoff.  Every scheduler pass therefore reopens admission as soon as
+        # the measured total headroom can hold the next worker's budget.
+        if system_available_thread_slots is not None and available_thread_slots < requested_threads:
+            external_detail = (
+                f"，外部CPU负载约 {external_cpu_percent:.1f}%"
+                if external_cpu_percent is not None
+                else ""
+            )
             if active_workers:
-                # Existing OCR workers retain their current allocation; the
-                # guardrail only prevents adding more work while another
-                # workload is consuming material CPU capacity.
-                target = min(target, active_workers)
-                reasons.append(f"外部CPU负载约 {external_cpu_percent:.1f}% ，暂不扩容")
-            elif admission_limit > 0:
-                # A fresh batch has no worker sample yet.  Reducing it to zero
-                # makes the scheduler spin forever without collecting the
-                # per-thread evidence that is supposed to drive later tuning.
-                # Keep one memory-admitted baseline worker, but do not expand
-                # until external CPU pressure drops.
-                target = min(target, 1)
                 reasons.append(
-                    f"外部CPU负载约 {external_cpu_percent:.1f}% ，仅启动1个基线worker，暂不扩容"
+                    f"整机CPU仅剩 {system_available_thread_slots} 个可用线程槽"
+                    f"{external_detail}，不足以启动 {requested_threads} 线程worker"
+                )
+            elif admission_limit > 0:
+                # A fresh batch has no worker sample yet.  Keep one baseline
+                # worker so later passes can observe actual per-thread usage.
+                reasons.append(
+                    f"整机CPU仅剩 {system_available_thread_slots} 个可用线程槽"
+                    f"{external_detail}，仅启动1个基线worker"
                 )
         if available_memory_gb <= self.reserve_memory_gb:
             target = min(target, active_workers)
@@ -447,6 +480,8 @@ class ResourceScheduler:
             used_saturated_threads=used_saturated_threads,
             used_thread_slots=used_thread_slots,
             available_thread_slots=available_thread_slots,
+            worker_available_thread_slots=worker_available_thread_slots,
+            system_available_thread_slots=system_available_thread_slots,
             additional_memory_slots=additional_memory_slots,
             external_cpu_percent=external_cpu_percent,
             throughput_pages_per_minute=throughput_pages_per_minute,

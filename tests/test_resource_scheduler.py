@@ -79,8 +79,14 @@ def test_scheduler_counts_available_memory_as_additional_worker_capacity(monkeyp
 def test_worker_threads_follow_page_band_without_exceeding_live_capacity() -> None:
     assert worker_threads_for_pages(20, capacity_threads=4, available_thread_slots=4) == 1
     assert worker_threads_for_pages(120, capacity_threads=4, available_thread_slots=4) == 2
-    assert worker_threads_for_pages(300, capacity_threads=4, available_thread_slots=4) == 3
-    assert worker_threads_for_pages(500, capacity_threads=4, available_thread_slots=4) == 4
+    assert worker_threads_for_pages(300, capacity_threads=4, available_thread_slots=4) == 2
+    assert worker_threads_for_pages(500, capacity_threads=4, available_thread_slots=4) == 2
+    assert worker_threads_for_pages(
+        300, capacity_threads=4, available_thread_slots=4, allow_high_thread_budget=True
+    ) == 3
+    assert worker_threads_for_pages(
+        500, capacity_threads=4, available_thread_slots=4, allow_high_thread_budget=True
+    ) == 4
     assert worker_threads_for_pages(500, capacity_threads=2, available_thread_slots=6) == 2
     assert worker_threads_for_pages(500, capacity_threads=4, available_thread_slots=1) == 1
 
@@ -131,7 +137,9 @@ def test_resource_scheduler_does_not_treat_one_saturated_thread_as_global_limit(
     assert plan.workers[0].thread_cpu_percent == {"ocr-thread": 99.0}
     assert plan.used_saturated_threads == 1
     assert plan.used_thread_slots == 1
-    assert plan.available_thread_slots == 13
+    assert plan.worker_available_thread_slots == 13
+    assert plan.system_available_thread_slots == 9
+    assert plan.available_thread_slots == 9
 
 
 def test_scheduler_allows_profiled_four_thread_worker_after_six_busy_threads(monkeypatch) -> None:
@@ -171,9 +179,51 @@ def test_scheduler_allows_profiled_four_thread_worker_after_six_busy_threads(mon
     assert plan.next_worker_threads == 4
     assert plan.used_saturated_threads == 6
     assert plan.used_thread_slots == 6
-    assert plan.available_thread_slots == 8
+    assert plan.worker_available_thread_slots == 8
+    assert plan.system_available_thread_slots == 6
+    assert plan.available_thread_slots == 6
     assert plan.throughput_pages_per_minute == 18.5
     assert plan.tuning_profile_id == "profile-1"
+
+
+def test_scheduler_reopens_worker_admission_after_system_load_declines(monkeypatch) -> None:
+    """A high external load may defer work, but cannot latch the batch at 2 workers."""
+
+    monkeypatch.setattr(scheduler_module.psutil, "cpu_count", lambda logical=True: 16 if logical else 8)
+    monkeypatch.setattr(
+        scheduler_module.psutil,
+        "virtual_memory",
+        lambda: type("Memory", (), {"total": 16 * 1024**3, "available": 12 * 1024**3})(),
+    )
+    cpu_samples = iter((90.0, 60.0))
+    monkeypatch.setattr(scheduler_module.psutil, "cpu_percent", lambda interval=0.05: next(cpu_samples))
+    monkeypatch.setattr(
+        ResourceScheduler,
+        "_worker_resource",
+        staticmethod(
+            lambda pid: WorkerResource(
+                pid,
+                12.5,
+                800.0,
+                5.0,
+                "可用",
+                {"ocr-a": 100.0, "ocr-b": 100.0},
+                2.0,
+            )
+        ),
+    )
+
+    scheduler = ResourceScheduler(max_workers=4)
+    busy_plan = scheduler.plan([101, 102], worker_thread_budgets={101: 2, 102: 2})
+    recovered_plan = scheduler.plan([101, 102], worker_thread_budgets={101: 2, 102: 2})
+
+    assert busy_plan.target_workers == 2
+    assert busy_plan.available_thread_slots == 0
+    # External load is still 35%, but four total threads remain after the
+    # system reserve; the next pass must automatically admit two 2-thread workers.
+    assert recovered_plan.external_cpu_percent == 35.0
+    assert recovered_plan.system_available_thread_slots == 4
+    assert recovered_plan.target_workers == 4
 
 
 def test_scheduler_does_not_force_first_worker_below_memory_reserve(monkeypatch) -> None:

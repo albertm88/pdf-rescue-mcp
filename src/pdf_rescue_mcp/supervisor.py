@@ -64,6 +64,10 @@ class LocalSupervisor:
     """
 
     LEASE_SECONDS = 45.0
+    # A controller lease has a different scope from a PDF-worker lease.  It is
+    # used by long-lived batch/watch controllers so that a second stdio MCP
+    # adapter can remain an observer instead of becoming a competing scheduler.
+    CONTROLLER_LEASE_SECONDS = 45.0
 
     def __init__(
         self,
@@ -182,6 +186,102 @@ class LocalSupervisor:
             )
             is not None
         )
+
+    def acquire_controller_lease(
+        self,
+        resource_key: str,
+        *,
+        ttl_seconds: float | None = None,
+    ) -> Lease | None:
+        """Acquire a local controller lease without creating an OCR task.
+
+        ``resource_key`` deliberately belongs to the supervision layer rather
+        than a FastMCP adapter.  This lets stdio, HTTP, VS Code, Trae, Codex,
+        and AnythingLLM share one local controller while every other adapter
+        performs observation only.
+        """
+        return self.store.acquire_lease(
+            f"controller:{resource_key}",
+            owner_id=self.owner_id,
+            ttl_seconds=ttl_seconds or self.CONTROLLER_LEASE_SECONDS,
+        )
+
+    def renew_controller_lease(
+        self,
+        lease: Lease,
+        *,
+        ttl_seconds: float | None = None,
+    ) -> Lease | None:
+        """Renew exactly the controller fencing token that this host owns."""
+        return self.store.renew_lease(
+            lease.resource_key,
+            owner_id=self.owner_id,
+            token=lease.token,
+            ttl_seconds=ttl_seconds or self.CONTROLLER_LEASE_SECONDS,
+        )
+
+    def release_controller_lease(self, lease: Lease) -> bool:
+        """Release only this host's exact controller fencing token."""
+        return self.store.release_lease(
+            lease.resource_key,
+            owner_id=self.owner_id,
+            token=lease.token,
+        )
+
+    def owns_controller_lease(self, lease: Lease) -> bool:
+        """Return whether this exact, unexpired controller token still owns work."""
+        current = self.store.get_lease(lease.resource_key)
+        return (
+            current is not None
+            and current.owner_id == self.owner_id
+            and current.token == lease.token
+        )
+
+    def reattach(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str | None,
+    ) -> SupervisedAttempt | None:
+        """Claim monitoring of an unleased durable attempt after a restart.
+
+        A restored adapter must never start a watcher merely because it can
+        read task metadata.  It first acquires the same fenced task lease as a
+        launcher; only the winner can supervise or recover the existing
+        attempt.  A fresh heartbeat from an old worker remains valid during the
+        handoff because this method does not rewrite its attempt record.
+        """
+        if not attempt_id:
+            return None
+        try:
+            task = self.store.get_task(job_id)
+        except Exception:
+            return None
+        if task.is_terminal:
+            return None
+        try:
+            lease = self.store.acquire_task_lease(
+                job_id,
+                owner_id=self.owner_id,
+                ttl_seconds=self.LEASE_SECONDS,
+            )
+        except Exception:
+            return None
+        if lease is None:
+            return None
+        try:
+            attempt = next(
+                item for item in self.store.list_attempts(job_id)
+                if item.attempt_id == attempt_id
+            )
+        except (StopIteration, Exception):
+            self.store.release_lease(
+                lease.resource_key,
+                owner_id=self.owner_id,
+                token=lease.token,
+            )
+            return None
+        return SupervisedAttempt(task=task, attempt=attempt, lease=lease)
 
     def request_cancel(self, context: SupervisedAttempt, *, reason: str) -> Task:
         """Persist a stop request before a caller signals the process tree."""
