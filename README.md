@@ -38,16 +38,54 @@
 
 ### 第一步：环境准备
 
-| 需求 | 说明 |
-|------|------|
-| **Python** | ≥ 3.11（[下载](https://www.python.org/downloads/)） |
-| **uv** | 包管理器（[安装指南](https://docs.astral.sh/uv/)） |
+#### 必需项
+
+| 需求 | 最低版本 | 说明 |
+|------|:------:|------|
+| **Python** | 3.11 | [下载地址](https://www.python.org/downloads/)，安装时勾选"添加到 PATH" |
+| **uv** | 最新 | Python 包管理器，[安装指南](https://docs.astral.sh/uv/)，安装后重启终端 |
+| **网络** | — | 首次运行时需联网下载中文 OCR 模型（约 50-100 MB），后续离线可用 |
 
 ```bash
-# 验证环境
+# 验证
 python --version   # 应 ≥ 3.11
-uv --version
+uv --version       # 应正常输出版本号
 ```
+
+#### 平台说明
+
+| 平台 | 支持情况 |
+|------|------|
+| **Windows 10/11** | ✅ 完全支持，CPU + NVIDIA GPU |
+| **macOS** | ✅ CPU 模式可用，GPU 加速需单独验证 |
+| **Linux** | ✅ CPU 模式可用，GPU 需自行安装 CUDA 驱动 |
+
+#### GPU 加速（可选）
+
+| 条件 | 要求 |
+|------|------|
+| **显卡** | NVIDIA GTX 10 系列及以上（计算能力 ≥ 6.1），✅ GTX 1060 6G 已验证 |
+| **驱动** | 已安装 NVIDIA 驱动，`nvidia-smi` 可正常输出 |
+| **CUDA** | 11.8（由 `uv sync --extra ocr-gpu` 自动安装，无需手动配置） |
+| **显存** | 建议 ≥ 4 GB（GTX 1060 6G 实测 `book-fast` 3-5 秒/页），显存不足自动降级为 CPU 模式 |
+
+> `ocr-gpu` 扩展会在 Windows 上自动安装 CUDA 11.8、cuDNN 8.9 等全套 NVIDIA 依赖，无需额外安装 Visual C++ 运行库。
+
+#### 可选外部工具
+
+体检命令会检测以下工具，缺失不影响核心功能：
+
+| 工具 | 用途 | 安装方式 |
+|------|------|------|
+| **Tesseract** | 备用 OCR 引擎（PaddleOCR 不可用时降级） | `winget install tesseract` 或 [GitHub](https://github.com/UB-Mannheim/tesseract/wiki) |
+| **Ghostscript** | PDF 底层渲染与修复 | `winget install ghostscript` 或 [官网](https://ghostscript.com/) |
+| **OCRmyPDF** | 文本层修复 | `pip install ocrmypdf` |
+| **qpdf** | PDF 结构检查 | `winget install qpdf` 或 [官网](https://github.com/qpdf/qpdf) |
+| **poppler (pdftoppm)** | 备用 PDF 转图片 | `winget install poppler` 或 [poppler](https://github.com/oschwartz10612/poppler-windows) |
+
+#### 首次运行
+
+首次 OCR 提取时，PaddleOCR 会自动从模型库下载 PP-OCRv6 中文识别模型。请保持网络通畅，下载完成后后续均可离线使用。模型缓存在 `~/.paddleocr/` 目录。
 
 ### 第二步：克隆并安装
 
@@ -121,12 +159,12 @@ uv run python -B scripts/batch_extract_all.py
 
 ## 识别模式
 
-| 模式 | DPI | 适用场景 | 速度（CPU） |
-|------|-----|----------|:-----------:|
-| `book-fast` | 180 | 快速预览、大批量处理 | 8-30 秒/页 |
-| `book-balanced` | 220 | 日常使用 ⭐ 默认 | 15-45 秒/页 |
-| `book-quality` | 300 | 高质量输出 | 30-90 秒/页 |
-| `book-forensic` | 300+ | 取证级、低质量扫描件 | 60-180 秒/页 |
+| 模式 | DPI | 适用场景 | 速度（CPU） | 速度（GTX 1060 6G） |
+|------|-----|----------|:-----------:|:------------------:|
+| `book-fast` | 180 | 快速预览、大批量处理 | 8-30 秒/页 | 3-5 秒/页 |
+| `book-balanced` | 220 | 日常使用 ⭐ 默认 | 15-45 秒/页 | 5-10 秒/页 |
+| `book-quality` | 300 | 高质量输出 | 30-90 秒/页 | 10-20 秒/页 |
+| `book-forensic` | 300+ | 取证级、低质量扫描件 | 60-180 秒/页 | 20-40 秒/页 |
 
 ---
 
@@ -332,7 +370,11 @@ uv run --locked --extra ocr python -B scripts/start_mcp.py
 
 - 自动检测 CPU 核心数，保留 2 核给系统
 - **NVIDIA GPU**：安装 `ocr-gpu` 扩展，CUDA 加速 3-5 倍
-- AMD Ryzen 7 5800H（8 核 16 线程）实测：`book-fast` 约 8-15 秒/页
+
+| 实测平台 | 配置 | 模式 | 速度 |
+|------|------|------|:------:|
+| AMD Ryzen 7 5800H | 8 核 16 线程 · CPU | `book-fast` | 8-15 秒/页 |
+| NVIDIA GTX 1060 | 笔记本 6 GB · GPU | `book-fast` | **3-5 秒/页** |
 
 ---
 
@@ -424,7 +466,7 @@ $env:PDF_RESCUE_MEMORY_PER_WORKER_GB = "4"
 <details>
 <summary><b>Q: 为什么速度一直是 30-40 秒/页？</b></summary>
 
-CPU 模式下这是正常速度。可尝试 `book-fast` 模式（DPI=180），或安装 NVIDIA GPU 扩展。
+CPU 模式下这是正常速度。可尝试 `book-fast` 模式（DPI=180），或安装 NVIDIA GPU 扩展（GTX 1060 6G 实测 `book-fast` 仅 3-5 秒/页）。
 </details>
 
 <details>

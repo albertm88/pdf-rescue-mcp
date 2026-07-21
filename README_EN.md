@@ -38,16 +38,54 @@ Current release line: **1.0.0** · [Architecture docs](docs/ARCHITECTURE_1.0.md)
 
 ### Step 1: Prerequisites
 
-| Requirement | Notes |
-|-------------|-------|
-| **Python** | ≥ 3.11 ([download](https://www.python.org/downloads/)) |
-| **uv** | Package manager ([install guide](https://docs.astral.sh/uv/)) |
+#### Required
+
+| Requirement | Minimum | Notes |
+|-------------|:------:|------|
+| **Python** | 3.11 | [Download](https://www.python.org/downloads/), check "Add to PATH" during install |
+| **uv** | Latest | Python package manager. [Install guide](https://docs.astral.sh/uv/), restart terminal after |
+| **Network** | — | First run downloads Chinese OCR models (~50-100 MB); works offline thereafter |
 
 ```bash
 # Verify
 python --version   # should be ≥ 3.11
-uv --version
+uv --version       # should print a version number
 ```
+
+#### Platform Support
+
+| Platform | Status |
+|------|------|
+| **Windows 10/11** | ✅ Full support, CPU + NVIDIA GPU |
+| **macOS** | ✅ CPU mode; GPU acceleration needs separate verification |
+| **Linux** | ✅ CPU mode; GPU requires manual CUDA driver installation |
+
+#### GPU Acceleration (Optional)
+
+| Condition | Requirement |
+|------|------|
+| **GPU** | NVIDIA GTX 10 series or newer (compute capability ≥ 6.1), ✅ GTX 1060 6G verified |
+| **Driver** | NVIDIA driver installed, `nvidia-smi` outputs normally |
+| **CUDA** | 11.8 (auto-installed by `uv sync --extra ocr-gpu`, no manual setup) |
+| **VRAM** | ≥ 4 GB recommended (GTX 1060 6G tested: `book-fast` 3-5 s/page); falls back to CPU if insufficient |
+
+> The `ocr-gpu` extras automatically install CUDA 11.8, cuDNN 8.9, and all NVIDIA dependencies on Windows. No separate Visual C++ runtime installation needed.
+
+#### Optional External Tools
+
+The health check detects these tools; missing them does not affect core functionality:
+
+| Tool | Purpose | Install |
+|------|------|------|
+| **Tesseract** | Fallback OCR engine (when PaddleOCR unavailable) | `winget install tesseract` or [GitHub](https://github.com/UB-Mannheim/tesseract/wiki) |
+| **Ghostscript** | Low-level PDF rendering and repair | `winget install ghostscript` or [website](https://ghostscript.com/) |
+| **OCRmyPDF** | Text layer repair | `pip install ocrmypdf` |
+| **qpdf** | PDF structure inspection | `winget install qpdf` or [GitHub](https://github.com/qpdf/qpdf) |
+| **poppler (pdftoppm)** | Alternative PDF to image conversion | `winget install poppler` or [poppler](https://github.com/oschwartz10612/poppler-windows) |
+
+#### First Run
+
+On the first OCR extraction, PaddleOCR automatically downloads the PP-OCRv6 Chinese recognition model from the model repository. Keep the network connected; once downloaded, all subsequent runs work offline. Models are cached in `~/.paddleocr/`.
 
 ### Step 2: Clone & Install
 
@@ -121,12 +159,12 @@ uv run python -B scripts/batch_extract_all.py
 
 ## Recognition Modes
 
-| Mode | DPI | Use Case | Speed (CPU) |
-|------|-----|----------|:-----------:|
-| `book-fast` | 180 | Quick preview, large batches | 8-30 s/page |
-| `book-balanced` | 220 | Daily use ⭐ default | 15-45 s/page |
-| `book-quality` | 300 | High-quality output | 30-90 s/page |
-| `book-forensic` | 300+ | Forensic, low-quality scans | 60-180 s/page |
+| Mode | DPI | Use Case | Speed (CPU) | Speed (GTX 1060 6G) |
+|------|-----|----------|:-----------:|:------------------:|
+| `book-fast` | 180 | Quick preview, large batches | 8-30 s/page | 3-5 s/page |
+| `book-balanced` | 220 | Daily use ⭐ default | 15-45 s/page | 5-10 s/page |
+| `book-quality` | 300 | High-quality output | 30-90 s/page | 10-20 s/page |
+| `book-forensic` | 300+ | Forensic, low-quality scans | 60-180 s/page | 20-40 s/page |
 
 ---
 
@@ -334,7 +372,11 @@ uv run --locked --extra ocr python -B scripts/start_mcp.py
 
 - Auto-detects CPU core count, reserves 2 cores for system
 - **NVIDIA GPU**: Install `ocr-gpu` extras for CUDA acceleration (3-5× speedup)
-- AMD Ryzen 7 5800H (8C/16T) tested: `book-fast` ~8-15 s/page
+
+| Tested Platform | Specs | Mode | Speed |
+|------|------|------|:------:|
+| AMD Ryzen 7 5800H | 8C/16T · CPU | `book-fast` | 8-15 s/page |
+| NVIDIA GTX 1060 | Laptop 6 GB · GPU | `book-fast` | **3-5 s/page** |
 
 ---
 
@@ -426,7 +468,7 @@ $env:PDF_RESCUE_MEMORY_PER_WORKER_GB = "4"
 <details>
 <summary><b>Q: Why is speed always 30-40 seconds per page?</b></summary>
 
-This is normal for CPU mode. Try `book-fast` mode (DPI=180), or install NVIDIA GPU extras.
+This is normal for CPU mode. Try `book-fast` mode (DPI=180), or install NVIDIA GPU extras (GTX 1060 6G tested: `book-fast` only 3-5 s/page).
 </details>
 
 <details>
