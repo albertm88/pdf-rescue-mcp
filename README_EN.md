@@ -6,9 +6,31 @@
 
 [中文](README.md) | English
 
-A local MCP service and CLI tool for Chinese book PDFs, supporting OCR text extraction from scanned PDFs, quality auditing, resume from breakpoints, and batch processing.
+A local MCP service and CLI tool for Chinese book PDFs. Supports OCR text extraction from scanned PDFs, quality auditing, breakpoint resume, and batch processing.
 
-Current release line: **1.0.0**. Full architecture details in [1.0 architecture document](docs/ARCHITECTURE_1.0.md).
+Current release line: **1.0.0** · [Architecture docs](docs/ARCHITECTURE_1.0.md)
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+  - [Step 1: Prerequisites](#step-1-prerequisites)
+  - [Step 2: Clone & Install](#step-2-clone--install)
+  - [Step 3: Health Check](#step-3-health-check)
+  - [Step 4: Configure MCP Client](#step-4-configure-mcp-client)
+  - [Step 5: Start Using](#step-5-start-using)
+- [Batch Processing](#batch-processing)
+- [Recognition Modes](#recognition-modes)
+- [Output Structure](#output-structure)
+- [CLI Usage](#cli-usage)
+- [Post-Processing: Entry Splitting](#post-processing-entry-splitting)
+- [MCP Tools Reference](#mcp-tools-reference)
+- [Architecture](#architecture)
+- [Performance Optimization](#performance-optimization)
+- [Configuration Reference](#configuration-reference)
+- [FAQ](#faq)
+- [Development](#development)
 
 ---
 
@@ -16,8 +38,10 @@ Current release line: **1.0.0**. Full architecture details in [1.0 architecture 
 
 ### Step 1: Prerequisites
 
-- **Python ≥ 3.11** ([download](https://www.python.org/downloads/))
-- **[uv](https://docs.astral.sh/uv/)** package manager
+| Requirement | Notes |
+|-------------|-------|
+| **Python** | ≥ 3.11 ([download](https://www.python.org/downloads/)) |
+| **uv** | Package manager ([install guide](https://docs.astral.sh/uv/)) |
 
 ```bash
 # Verify
@@ -30,13 +54,12 @@ uv --version
 ```bash
 git clone https://github.com/albertm88/pdf-rescue-mcp.git
 cd pdf-rescue-mcp
-
-# CPU mode (all platforms)
-uv sync --extra ocr
-
-# NVIDIA GPU acceleration (CUDA 11.8, 3-5x speedup)
-uv sync --extra ocr-gpu
 ```
+
+| Scenario | Command | Notes |
+|----------|---------|-------|
+| Daily use (CPU) | `uv sync --extra ocr` | All platforms |
+| NVIDIA GPU | `uv sync --extra ocr-gpu` | CUDA 11.8, 3-5× speedup |
 
 ### Step 3: Health Check
 
@@ -48,10 +71,9 @@ Should display CPU cores, available memory, OCR engine status, etc.
 
 ### Step 4: Configure MCP Client
 
-Generate a local config with absolute paths so clients can locate the launch script:
+> Generate a local config with absolute paths so clients can locate the launch script.
 
 ```bash
-# Pick your client:
 uv run python scripts/generate_mcp_config.py --client vscode     --output .vscode/mcp.json
 uv run python scripts/generate_mcp_config.py --client claude     --output ~/claude-mcp.json
 uv run python scripts/generate_mcp_config.py --client cursor     --output ~/cursor-mcp.json
@@ -60,7 +82,7 @@ uv run python scripts/generate_mcp_config.py --client trae       --output .trae/
 uv run python scripts/generate_mcp_config.py --client codex      --output ~/codex-mcp.toml
 ```
 
-> Alternatively, copy templates from `examples/` and replace `{{PROJECT_ROOT}}` with the absolute project path. VS Code users can directly use `examples/mcp-config.vscode.json` (`${workspaceFolder}` needs no replacement).
+> **Manual config**: Copy templates from `examples/` and replace `{{PROJECT_ROOT}}` with the absolute project path. VS Code users can use `examples/mcp-config.vscode.json` directly (`${workspaceFolder}` needs no replacement).
 
 ### Step 5: Start Using
 
@@ -68,7 +90,9 @@ In your MCP client, simply tell the AI:
 
 > Extract text from `D:\scanned-books\some-book.pdf`
 
-The AI will automatically call the `rescue_pdf` tool to complete the full pipeline: diagnose → plan → OCR → audit. Results are saved to `<PDF-sibling-dir>/pdf_rescue_output/<book-name>-rescue-result/`.
+The AI will automatically call `rescue_pdf` to complete the full pipeline: **Diagnose → Plan → OCR → Audit**.
+
+📁 Results saved to: `<PDF-sibling-dir>/pdf_rescue_output/<book-name>-rescue-result/`
 
 ---
 
@@ -77,41 +101,34 @@ The AI will automatically call the `rescue_pdf` tool to complete the full pipeli
 For large collections of PDFs:
 
 ```bash
-# Scan library
+# 1. Scan library
 uv run python -m pdf_rescue_mcp.cli 书库扫描 <library-dir>
 
-# Start batch extraction (background, resumable)
+# 2. Start batch extraction (background, resumable)
 uv run python -B scripts/batch_extract_all.py
 ```
 
-The batch controller:
-- Auto-discovers all PDFs in the library
-- Dynamically allocates concurrency based on CPU, memory, and per-worker load
-- Caches per-page, auto-resumes from breakpoint after restart
-- Prints progress every 30 seconds (completed/in-progress/queued books, pages, ETA, resource usage)
+**Batch controller capabilities:**
 
-The default batch script processes PDFs from `D:\BaiduNetdiskDownload\dabao` and outputs to `D:\农业百科全书-转文字\`. Edit `ROOT` and `OUTPUT` in `scripts/batch_extract_all.py` to match your library.
+- 🔍 Auto-discovers all PDFs in the library
+- 📊 Dynamically allocates concurrency based on CPU, memory, and per-worker load
+- 💾 Per-page caching, auto-resumes from breakpoint on restart
+- 📈 Progress report every 30s (completed/in-progress/queued, pages, ETA, resources)
+
+**Custom library path:** Edit `ROOT` and `OUTPUT` in `scripts/batch_extract_all.py`.
 
 ---
-
-## Features
-
-- **One-Click Rescue**: Single `rescue_pdf` tool automates the full pipeline: diagnose → plan → extract → audit
-- **Three-Layer Runtime**: Business layer (isolated OCR, atomic page cache) + Supervision layer (SQLite lease, heartbeat/page-progress watchdog, portable process control) + Iteration layer (auditable advisory plans only)
-- **Batch Processing**: Independent OCR workers keep MCP responsive; dynamic concurrency based on CPU threads, available memory, and per-worker utilization
-- **Resume from Breakpoints**: Per-page caching, auto-resume from last checkpoint after interruption
-- **Quality Auditing**: Low-confidence page detection, failed page logging, page evidence export
-- **CPU/GPU Auto-Detection**: Automatically detects NVIDIA GPU acceleration; CPU mode with optimized thread count
-- **Chinese Optimization**: Built-in term glossary, OCR post-processing, Chinese punctuation cleanup
 
 ## Recognition Modes
 
 | Mode | DPI | Use Case | Speed (CPU) |
-|------|-----|----------|-------------|
-| `book-fast` | 180 | Quick preview, large batch processing | ~8-30s/page |
-| `book-balanced` | 220 | Daily use (default) | ~15-45s/page |
-| `book-quality` | 300 | High-quality output | ~30-90s/page |
-| `book-forensic` | 300+ | Forensic level, low-quality scans | ~60-180s/page |
+|------|-----|----------|:-----------:|
+| `book-fast` | 180 | Quick preview, large batches | 8-30 s/page |
+| `book-balanced` | 220 | Daily use ⭐ default | 15-45 s/page |
+| `book-quality` | 300 | High-quality output | 30-90 s/page |
+| `book-forensic` | 300+ | Forensic, low-quality scans | 60-180 s/page |
+
+---
 
 ## Output Structure
 
@@ -123,8 +140,7 @@ The default batch script processes PDFs from `D:\BaiduNetdiskDownload\dabao` and
 │   └── 全书.md            # Merged full text in Markdown
 ├── 数据/
 │   ├── 页面.jsonl         # Per-page text + confidence + source
-│   ├── 片段.jsonl         # Segment text
-│   ├── 质量.json          # Quality report (low-confidence, failed page stats)
+│   ├── 质量.json          # Quality report
 │   ├── 低置信页.jsonl     # Low-confidence page details
 │   └── 失败页.jsonl       # Failed page details
 ├── 缓存/
@@ -134,50 +150,45 @@ The default batch script processes PDFs from `D:\BaiduNetdiskDownload\dabao` and
 └── 日志/                  # Subprocess runtime logs
 ```
 
+---
+
 ## CLI Usage
 
 Besides MCP, you can use the CLI directly:
 
 ```bash
-# Health check
-uv run python -m pdf_rescue_mcp.cli 体检
+# ── Diagnostics ──
+uv run python -m pdf_rescue_mcp.cli 体检                    # Health check
+uv run python -m pdf_rescue_mcp.cli 检查 <pdf-path>          # Inspect PDF type
+uv run python -m pdf_rescue_mcp.cli 规划 <pdf-path>          # Plan processing route
 
-# Inspect PDF
-uv run python -m pdf_rescue_mcp.cli 检查 <pdf-path>
+# ── Extraction ──
+uv run python -m pdf_rescue_mcp.cli 提取 <pdf-path>          # Extract single book
+    --mode book-fast --output-dir <output-dir>
 
-# Plan processing
-uv run python -m pdf_rescue_mcp.cli 规划 <pdf-path>
+# ── Management ──
+uv run python -m pdf_rescue_mcp.cli 状态 <task-dir>           # Query progress
+uv run python -m pdf_rescue_mcp.cli 恢复 <task-dir>           # Resume interrupted task
+uv run python -m pdf_rescue_mcp.cli 质检 <task-dir>           # Quality audit
 
-# Extract single book
-uv run python -m pdf_rescue_mcp.cli 提取 <pdf-path> --mode book-fast --output-dir <output-dir>
-
-# Query status
-uv run python -m pdf_rescue_mcp.cli 状态 <task-dir>
-
-# Resume task
-uv run python -m pdf_rescue_mcp.cli 恢复 <task-dir>
-
-# Quality audit
-uv run python -m pdf_rescue_mcp.cli 质检 <task-dir>
-
-# Scan library
-uv run python -m pdf_rescue_mcp.cli 书库扫描 <library-dir>
-
-# Batch extract
-uv run python -m pdf_rescue_mcp.cli 书库提取 <library-dir> --output-dir <output-dir> --mode book-fast
+# ── Batch ──
+uv run python -m pdf_rescue_mcp.cli 书库扫描 <library-dir>     # Scan library
+uv run python -m pdf_rescue_mcp.cli 书库提取 <library-dir>     # Batch extract
+    --output-dir <output-dir> --mode book-fast
 ```
+
+---
 
 ## Post-Processing: Entry Splitting
 
-After OCR completes, use `scripts/split_into_entries_v2.py` to split the full text into individual encyclopedia entry Markdown files:
+After OCR completes, split the full text into individual encyclopedia entry Markdown files:
 
 ```bash
-uv run python scripts/split_into_entries_v2.py \
-  <rescue-result-dir> \
-  <final-output-dir>
+uv run python scripts/split_into_entries_v2.py <rescue-result-dir> <final-output-dir>
 ```
 
 Output structure:
+
 ```
 <final-output-dir>/<book-name>/
 ├── 前言/
@@ -185,7 +196,7 @@ Output structure:
 ├── 条目/
 │   ├── 鳖甲.md
 │   ├── 冰硼散.md
-│   └── ... (hundreds of entry files)
+│   └── ...
 └── 索引.md
 ```
 
@@ -197,13 +208,13 @@ Output structure:
 
 | Tool | Description |
 |------|-------------|
-| `rescue_pdf` | **Primary entry point**: Auto diagnose → plan → extract → audit. Just pass the PDF path. |
+| `rescue_pdf` | ⭐ **Primary entry point**: Auto diagnose → plan → extract → audit. Just pass the PDF path. |
 | `extract_book_text` | Extract book text, runs in background subprocess, returns task directory immediately. |
 | `get_job_status` | Query task progress (pages, speed, ETA, thread health). |
 | `resume_job` | Resume interrupted task (breakpoint continuation). |
 | `cancel_job` | Request a safe page-boundary stop. |
 | `audit_job_quality` | Quality audit (low-confidence pages, failed pages, split heading detection). |
-| `get_iteration_plan` | Produce a versioned quality/resource improvement plan, requires manual approval. |
+| `get_iteration_plan` | Produce a versioned quality/resource improvement plan; requires manual approval. |
 
 ### Batch Processing
 
@@ -246,7 +257,7 @@ Output structure:
 | Tool | Description |
 |------|-------------|
 | `get_processing_history` | View processing history. |
-| `share_processing_history` | Generate shareable history records (JSON/Markdown/HTML). |
+| `share_processing_history` | Generate shareable history records (JSON / Markdown / HTML). |
 
 ---
 
@@ -284,7 +295,7 @@ Output structure:
 └─────────────────────────────────────────────────────────┘
 ```
 
-## 1.0 Three-Layer Runtime
+### 1.0 Three-Layer Runtime
 
 | Layer | Mechanism | Parameters |
 |-------|-----------|------------|
@@ -297,18 +308,18 @@ Output structure:
 Supervision state uses OS-standard directories (Windows `%APPDATA%`, macOS `~/Library`, Linux XDG). Override with:
 
 ```bash
-# Linux/macOS
+# Linux / macOS
 export PDF_RESCUE_RUNTIME_ROOT=/path/to/pdf-rescue-runtime
 
 # Windows PowerShell
 $env:PDF_RESCUE_RUNTIME_ROOT = "D:\pdf-rescue-runtime"
 ```
 
-> Keep the SQLite task database on a local disk, not a network or sync share.
+> ⚠️ Keep the SQLite task database on a local disk, not a network or sync share.
 
 ### Optional: Streamable HTTP mode
 
-For MCP clients that cannot launch stdio subprocesses. Loopback-only:
+For MCP clients that cannot launch stdio subprocesses (loopback only):
 
 ```powershell
 $env:PDF_RESCUE_MCP_TRANSPORT = "streamable-http"
@@ -321,33 +332,114 @@ uv run --locked --extra ocr python -B scripts/start_mcp.py
 
 ## Performance Optimization
 
-### CPU Thread Configuration
-
 - Auto-detects CPU core count, reserves 2 cores for system
-- Normal batch starts remain conservative; capacity profiling can measure 2/4/6/8 thread and multi-worker combinations
-- AMD Ryzen 7 5800H (8 cores/16 threads) tested: book-fast mode ~8-15s/page
+- **NVIDIA GPU**: Install `ocr-gpu` extras for CUDA acceleration (3-5× speedup)
+- AMD Ryzen 7 5800H (8C/16T) tested: `book-fast` ~8-15 s/page
 
-### GPU Acceleration
+---
 
-- **NVIDIA GPU**: Install `ocr-gpu` extras for automatic CUDA acceleration (3-5x speedup)
-- **AMD GPU**: PaddlePaddle doesn't support ROCm on Windows; Linux required
-- **MKLDNN/oneDNN**: Disabled by default on AMD CPUs
+## Configuration Reference
+
+The following environment variables and parameters allow fine-grained control over resource allocation and supervision behavior. Set them in the terminal before launching — no source code changes needed.
+
+### Worker Threads & Concurrency
+
+| Env / Parameter | Default | Description |
+|:---|:---:|:---|
+| `PDF_RESCUE_OCR_THREADS` | Auto (1–4) | OCR threads per worker. Auto-calculated from physical cores, capped at 4 |
+| `PDF_RESCUE_MAX_WORKERS` | Auto (≤4) | Max parallel workers. Auto-calculated from CPU cores + memory |
+
+**Auto thread allocation:** Physical cores ≥ 8 → 4 threads; 6–7 → 3; 4–5 → 2; ≤3 → 1. Always reserves 2 logical cores for the system.
+
+**Worker thread budget (per page count):** <80 pages → 1 thread; ≥80 → 2; ≥200 → 3; ≥400 → 4.
+
+```bash
+# Example: force 2 threads per worker, max 3 parallel workers
+$env:PDF_RESCUE_OCR_THREADS = "2"
+$env:PDF_RESCUE_MAX_WORKERS = "3"
+```
+
+### Memory Control
+
+| Env / Parameter | Default | Description |
+|:---|:---:|:---|
+| `PDF_RESCUE_RESERVE_MEMORY_GB` | 2.0 GB | Memory reserved for OS; no new workers below this threshold |
+| `PDF_RESCUE_MEMORY_PER_WORKER_GB` | 2.0 GB | Estimated memory per worker, used for slot calculation |
+
+Memory slots = `(available - reserved) ÷ per_worker`. Combined with CPU core constraints, the minimum determines actual concurrency.
+
+```bash
+# Example: large RAM machine, 4 GB per worker, 4 GB reserved
+$env:PDF_RESCUE_RESERVE_MEMORY_GB = "4"
+$env:PDF_RESCUE_MEMORY_PER_WORKER_GB = "4"
+```
+
+### Supervision Timeouts
+
+| Parameter | Default | Description |
+|:---|:---:|:---|
+| `WATCH_INTERVAL` | 5 s | Task watchdog polling interval |
+| `HEARTBEAT_TIMEOUT` | 90 s | Worker heartbeat timeout: no heartbeat → considered lost |
+| `PROGRESS_TIMEOUT` | 600 s | Progress timeout: alive but no page progress → considered stuck |
+| `STARTUP_TIMEOUT` | 120 s | Startup timeout: wait for worker's first heartbeat |
+| `CANCEL_GRACE` | 45 s | Cancel grace period: wait for graceful shutdown after cancel signal |
+| `MAX_AUTO_RESTART` | 1 | Max auto-restart attempts after abnormal exit |
+
+### Batch Controller
+
+| Parameter | Default | Description |
+|:---|:---:|:---|
+| `PAGE_RATE_SAMPLE_WINDOW` | 300 s | Page-rate sampling sliding window |
+| `PAGE_RATE_MAX_SAMPLES` | 12 | Max page-rate samples retained |
+| `OBSERVER_TAKEOVER_INTERVAL` | 5 s | Passive observer takeover polling interval |
+| `CONTROLLER_LEASE_SECONDS` | 45 s | Batch controller local exclusive lease TTL |
+| `LEASE_SECONDS` | 45 s | Single-task MCP adapter lease TTL |
+
+### Capacity Tuning Gates
+
+| Parameter | Default | Description |
+|:---|:---:|:---|
+| System CPU safety ceiling | 92% | Candidates rejected if CPU exceeds this during trials |
+| Throughput improvement threshold | 5% | Multi-worker must beat best single-worker baseline by this ratio |
+| Quality regression tolerance | 3% | Allowed low-confidence page ratio regression for multi-worker |
+
+### Quality Thresholds
+
+| Parameter | Default | Description |
+|:---|:---:|:---|
+| `LOW_CONFIDENCE_THRESHOLD` | 0.9 | Confidence below this triggers quality warning |
+| `LOW_CONFIDENCE_RETRY_DPI` | 300 | Auto-retry DPI for low-confidence pages |
+| `LOW_CONFIDENCE_MIN_TEXT_RATIO` | 0.85 | Minimum text ratio for low-confidence retry |
+
+### Runtime Directory
+
+| Env Variable | Default | Description |
+|:---|:---|:---|
+| `PDF_RESCUE_RUNTIME_ROOT` | OS standard dir | Supervision layer runtime persistence root (SQLite ledger, etc.) |
+
+> ⚠️ Timeout, window, and other parameters above are currently hardcoded constants. Tuning requires editing class attributes in `_TaskManager` within `src/pdf_rescue_mcp/server.py`. Environment variable overrides will be supported in a future release.
 
 ---
 
 ## FAQ
 
-### Q: Why is speed always 30-40 seconds per page?
-A: This is normal for CPU mode. Try `book-fast` mode (DPI=180), or install NVIDIA GPU extras.
+<details>
+<summary><b>Q: Why is speed always 30-40 seconds per page?</b></summary>
 
-### Q: What if subprocesses restart frequently?
-A: Check error logs in `logs/`. Common causes: out of memory, corrupted PDF (run `diagnose_pdf` first).
+This is normal for CPU mode. Try `book-fast` mode (DPI=180), or install NVIDIA GPU extras.
+</details>
 
-### Q: How does resume from breakpoints work?
-A: After each page completes, OCR results are cached to `缓存/页面OCR/*.json`. On restart, cached pages are skipped automatically.
+<details>
+<summary><b>Q: How does breakpoint resume work?</b></summary>
 
-### Q: How to handle password-protected PDFs?
-A: Pass the `password` parameter when using `rescue_pdf`. Passwords are never written to record files.
+After each page completes, OCR results are cached to `缓存/页面OCR/*.json`. On restart, cached pages are skipped automatically.
+</details>
+
+<details>
+<summary><b>Q: How to handle password-protected PDFs?</b></summary>
+
+Pass the `password` parameter when using `rescue_pdf`. Passwords are never written to record files.
+</details>
 
 ---
 
@@ -367,6 +459,8 @@ uv run ruff check src/
 uv run python -B scripts/start_mcp.py
 ```
 
+---
+
 ## License
 
-GPL-3.0-or-later - see [LICENSE](LICENSE) for details.
+GPL-3.0-or-later · see [LICENSE](LICENSE)
